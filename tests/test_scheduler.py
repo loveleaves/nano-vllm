@@ -146,3 +146,112 @@ class TestSchedulerFCFS:
         sched.postprocess(seqs, [10], p)
         assert sched.is_finished()
         assert len(sched.block_manager.free_block_ids) == initial_free
+
+
+# ─── Phase 4：Chunked Prefill ───────────────────────────────────────────────────
+
+
+def _make_sched_p4(num_blocks=10, block_size=4, max_seqs=8,
+                   max_batched_tokens=16, eos=-1):
+    Sequence.block_size = block_size
+    return Scheduler(num_blocks, block_size, max_seqs, max_batched_tokens, eos)
+
+
+def _make_seq_p4(num_tokens, block_size=4, max_tokens=10):
+    Sequence.block_size = block_size
+    return Sequence(list(range(num_tokens)), SamplingParams(max_tokens=max_tokens))
+
+
+class TestSchedulerChunkedPrefill:
+
+    @pytest.mark.unit
+    def test_chunked_prefill_two_rounds(self):
+        sched = _make_sched_p4(num_blocks=10, max_batched_tokens=4)
+        seq = _make_seq_p4(8)
+        sched.add(seq)
+
+        seqs, is_prefill = sched.schedule()
+        assert is_prefill and len(seqs) == 1
+        assert seqs[0].num_scheduled_tokens == 4
+
+        sched.postprocess(seqs, [99], is_prefill)
+        assert seq.num_cached_tokens == 4
+        assert seq.num_tokens == 8
+
+        seqs2, is_prefill2 = sched.schedule()
+        assert is_prefill2 and seqs2[0].num_scheduled_tokens == 4
+
+        sched.postprocess(seqs2, [42], is_prefill2)
+        assert seq.num_cached_tokens == 8
+        assert seq.num_tokens == 9
+
+    @pytest.mark.unit
+    def test_only_first_seq_chunked(self):
+        sched = _make_sched_p4(num_blocks=20, max_batched_tokens=4)
+        seq1 = _make_seq_p4(8)
+        seq2 = _make_seq_p4(4)
+        sched.add(seq1)
+        sched.add(seq2)
+
+        seqs, is_prefill = sched.schedule()
+        assert is_prefill and len(seqs) == 1
+        assert seqs[0] is seq1
+
+    @pytest.mark.unit
+    def test_chunked_seq_stays_in_waiting(self):
+        sched = _make_sched_p4(num_blocks=10, max_batched_tokens=4)
+        seq = _make_seq_p4(8)
+        sched.add(seq)
+
+        seqs, is_prefill = sched.schedule()
+        sched.postprocess(seqs, [0], is_prefill)
+
+        assert seq.status == SequenceStatus.WAITING
+        assert seq in sched.waiting
+
+
+# ─── Phase 4：抢占调度 ──────────────────────────────────────────────────────────
+
+
+class TestSchedulerPreemption:
+
+    @pytest.mark.unit
+    def test_preempt_running_seq_when_no_free_blocks(self):
+        sched = _make_sched_p4(num_blocks=2, max_batched_tokens=8)
+        seq1 = _make_seq_p4(4)
+        seq2 = _make_seq_p4(4)
+        sched.add(seq1)
+        sched.add(seq2)
+
+        seqs, is_prefill = sched.schedule()
+        sched.postprocess(seqs, [1], is_prefill)
+        seqs, is_prefill = sched.schedule()
+        sched.postprocess(seqs, [2], is_prefill)
+
+        seqs, is_prefill = sched.schedule()
+        assert not is_prefill
+
+    @pytest.mark.unit
+    def test_preempt_restores_seq_to_waiting_head(self):
+        sched = _make_sched_p4(num_blocks=10, max_batched_tokens=8)
+        seq = _make_seq_p4(4)
+        sched.add(seq)
+
+        seqs, is_prefill = sched.schedule()
+        sched.postprocess(seqs, [1], is_prefill)
+        assert seq.status == SequenceStatus.RUNNING
+
+        sched.preempt(seq)
+        assert seq.status == SequenceStatus.WAITING
+        assert seq.is_prefill is True
+        assert seq.block_table == []
+        assert sched.waiting[0] is seq
+
+    @pytest.mark.unit
+    def test_memory_full_deadlock_protection(self):
+        sched = _make_sched_p4(num_blocks=1, max_batched_tokens=16)
+        seq = _make_seq_p4(8)
+        sched.add(seq)
+
+        seqs, is_prefill = sched.schedule()
+        assert seqs == [] and is_prefill

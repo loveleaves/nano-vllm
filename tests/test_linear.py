@@ -130,3 +130,10 @@ class TestLinearWeightLoader:
         linear.weight_loader(linear.weight, w1, 1)
         assert torch.allclose(linear.weight.data[:8], w0)
         assert torch.allclose(linear.weight.data[8:16], w1)
+
+    @pytest.mark.unit
+    def test_row_parallel_forward_no_dist(self):
+        layer = RowParallelLinear(8, 4)
+        with torch.no_grad():
+            y = layer(torch.randn(3, 8))
+        assert y.shape == (3, 4)

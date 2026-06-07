@@ -1,7 +1,9 @@
+import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -12,13 +14,11 @@ from nanovllm.engine.model_runner import ModelRunner
 
 class LLMEngine:
     """
-    推理引擎主入口（Phase 3：单进程，无 TP）。
+    推理引擎主入口（Phase 4：多进程 TP）。
 
-    职责：
-      1. 初始化 ModelRunner（GPU 推理）
-      2. 管理 tokenizer
-      3. 通过 Scheduler 调度请求
-      4. 对外提供 generate() 接口
+    多进程架构：
+      rank 0（主进程）：调度 + 推理 + 采样
+      rank 1..N（子进程）：ModelRunner.loop()，通过 SharedMemory+Event 等待指令
     """
 
     def __init__(self, model: str, **kwargs):
@@ -27,7 +27,19 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
 
-        self.model_runner = ModelRunner(config)
+        self.ps = []
+        self.events = []
+        ctx = mp.get_context("spawn")
+
+        for i in range(1, config.tensor_parallel_size):
+            event = ctx.Event()
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process.start()
+            self.ps.append(process)
+            self.events.append(event)
+
+        self.model_runner = ModelRunner(config, 0, self.events)
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
 
@@ -38,6 +50,13 @@ class LLMEngine:
             max_num_batched_tokens=config.max_num_batched_tokens,
             eos=config.eos,
         )
+        atexit.register(self.exit)
+
+    def exit(self):
+        self.model_runner.call("exit")
+        del self.model_runner
+        for p in self.ps:
+            p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -51,7 +70,7 @@ class LLMEngine:
             return [], 0
         num_tokens = (sum(seq.num_scheduled_tokens for seq in seqs)
                       if is_prefill else -len(seqs))
-        token_ids = self.model_runner.run(seqs, is_prefill)
+        token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
@@ -65,7 +84,8 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[dict]:
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        pbar = tqdm(total=len(prompts), desc="Generating",
+                    dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
 

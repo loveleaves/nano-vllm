@@ -8,12 +8,12 @@ class RMSNorm(nn.Module):
 
     两种 forward 路径：
     1. rms_forward(x): 标准 RMSNorm，x = x / rms * weight
-    2. add_rms_forward(x, residual): Fused Add-RMSNorm，合并残差相加与归一化
-       residual = x + residual
-       x = rms_norm(residual)
-       避免两次单独的内存读写，节省约 50% HBM 带宽。
+    2. add_rms_forward(x, residual): Fused Add-RMSNorm：
+         residual = x + residual    → 更新残差流
+         x = rms_norm(residual)     → 归一化
+       避免两次单独内存读写，节省约 50% HBM 带宽。
 
-    forward 调度：residual is None → rms_forward，否则 → add_rms_forward
+    @torch.compile：将多个 elementwise 算子融合为单个 kernel。
     均在 float32 下计算以保证精度，结果转回原 dtype。
     """
 
@@ -22,6 +22,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
+    @torch.compile
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_dtype = x.dtype
         x = x.float()
@@ -29,6 +30,7 @@ class RMSNorm(nn.Module):
         x = x * torch.rsqrt(var + self.eps)
         return (x * self.weight.float()).to(orig_dtype)
 
+    @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,

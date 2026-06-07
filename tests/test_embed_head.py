@@ -75,3 +75,48 @@ class TestLMHead:
         assert torch.allclose(out[0:1], expected_0, atol=1e-5)
         reset_context()
 
+
+# ─── Phase 4：VocabParallelEmbedding / ParallelLMHead（TP=1 等价验证） ──────────
+
+
+class TestParallelEmbedHeadPhase4:
+
+    @pytest.mark.unit
+    def test_vocab_parallel_embedding_forward_shape(self):
+        from nanovllm.layers.embed_head import VocabParallelEmbedding
+        emb = VocabParallelEmbedding(100, 16)
+        out = emb(torch.tensor([0, 5, 99, 42, 7]))
+        assert out.shape == (5, 16)
+
+    @pytest.mark.unit
+    def test_vocab_parallel_embedding_equivalence(self):
+        from nanovllm.layers.embed_head import VocabParallelEmbedding
+        emb = VocabParallelEmbedding(64, 8)
+        nn.init.normal_(emb.weight)
+        ref = nn.Embedding(64, 8)
+        ref.weight.data.copy_(emb.weight.data)
+        token_ids = torch.tensor([0, 10, 63])
+        assert torch.allclose(emb(token_ids), ref(token_ids))
+
+    @pytest.mark.unit
+    def test_parallel_lm_head_decode(self):
+        from nanovllm.layers.embed_head import ParallelLMHead
+        reset_context()
+        set_context(False)
+        head = ParallelLMHead(64, 8)
+        nn.init.normal_(head.weight)
+        out = head(torch.randn(3, 8))
+        assert out.shape == (3, 64)
+        reset_context()
+
+    @pytest.mark.unit
+    def test_parallel_lm_head_prefill_extracts_last(self):
+        from nanovllm.layers.embed_head import ParallelLMHead
+        reset_context()
+        cu_q = torch.tensor([0, 3, 5], dtype=torch.int32)
+        set_context(True, cu_seqlens_q=cu_q)
+        head = ParallelLMHead(64, 8)
+        nn.init.normal_(head.weight)
+        out = head(torch.randn(5, 8))
+        assert out.shape == (2, 64)
+        reset_context()

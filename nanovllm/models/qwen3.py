@@ -4,20 +4,22 @@ from torch import nn
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.linear import (
+    QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear,
+)
 from nanovllm.layers.rotary_embedding import get_rope
-from nanovllm.layers.embed_head import VocabEmbedding, LMHead
-from nanovllm.utils.context import set_context
+from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3Attention(nn.Module):
     """
     Qwen3 注意力模块，支持 GQA 和 QK-Norm。
 
-    架构特点：
+    架构：
       - GQA：Q head 数 > KV head 数
-      - QK-Norm：qkv_bias=False 时对 Q/K 做 RMSNorm
+      - QK-Norm：qkv_bias=False 时对 Q/K 各做一次 RMSNorm
       - RoPE：@lru_cache 单例，所有层共享
+      - TP：QKV 列并行，O 行并行
     """
 
     def __init__(
@@ -33,24 +35,31 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ):
         super().__init__()
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
         self.head_dim = head_dim or hidden_size // num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size, self.head_dim, num_heads, num_kv_heads, bias=qkv_bias,
         )
+        # 运行时 num_heads/num_kv_heads 会被 TP 切分
+        from nanovllm.layers.linear import _get_tp_info, divide
+        _, tp_size = _get_tp_info()
+        self.num_heads = divide(num_heads, tp_size)
+        self.num_kv_heads = divide(num_kv_heads, tp_size)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim ** -0.5
+
         self.o_proj = RowParallelLinear(num_heads * self.head_dim, hidden_size, bias=False)
 
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
-        self.rotary_emb = get_rope(self.head_dim, rotary_dim=self.head_dim,
-                                   max_position=max_position, base=rope_theta)
-
+        self.rotary_emb = get_rope(
+            self.head_dim, rotary_dim=self.head_dim,
+            max_position=max_position, base=rope_theta,
+        )
         self.attn = Attention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads)
 
         if not self.qkv_bias:
@@ -72,7 +81,7 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-    """Qwen3 FFN 层：SwiGLU (gate_up_proj → SiluAndMul → down_proj)。"""
+    """Qwen3 FFN：SwiGLU (gate_up_proj → SiluAndMul → down_proj)。"""
 
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str):
         super().__init__()
@@ -90,8 +99,8 @@ class Qwen3DecoderLayer(nn.Module):
     Qwen3 Transformer 解码层（Pre-LN + Fused Add-RMSNorm）。
 
     残差流在层间传递：
-      首层: hidden, residual = norm(hidden), hidden
-      后续: hidden, residual = norm(hidden + residual)（fused）
+      首层:  hidden, residual = norm(hidden), hidden
+      后续:  hidden, residual = norm(hidden + residual)（fused）
     """
 
     def __init__(self, config) -> None:
@@ -132,12 +141,12 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    """Qwen3 基础 Transformer（不含 LM Head）。"""
-
     def __init__(self, config) -> None:
         super().__init__()
-        self.embed_tokens = VocabEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -151,10 +160,10 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(nn.Module):
     """
-    Qwen3 因果语言模型（含 LM Head）。
+    Qwen3 因果语言模型（完整版，含 TP + CUDA graph 兼容接口）。
 
-    packed_modules_mapping：HF 权重名 → nano-vllm 参数名的映射，
-    用于 load_model 将分散的 HF 权重正确加载到合并参数中。
+    packed_modules_mapping：HF 权重名 → nano-vllm 参数名的映射。
+    forward 与 compute_logits 分离：CUDA graph 只录 forward（不含 lm_head）。
     """
 
     packed_modules_mapping = {
@@ -168,7 +177,7 @@ class Qwen3ForCausalLM(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
-        self.lm_head = LMHead(config.vocab_size, config.hidden_size)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 

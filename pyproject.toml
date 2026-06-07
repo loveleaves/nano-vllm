@@ -1,0 +1,48 @@
+[build-system]
+requires = [
+    "setuptools>=69",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-vllm"
+version = "0.1.0"
+description = "A minimal vLLM implementation for learning and experimentation"
+requires-python = ">=3.11"
+
+dependencies = [
+    "torch",
+    "transformers",
+    "safetensors",
+    "xxhash",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-timeout",
+]
+
+gpu = [
+    "flash-attn",
+    "triton",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanovllm*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: pure Python tests, no GPU required",
+    "gpu: requires CUDA GPU",
+]
+
+testpaths = [
+    "tests",
+]
+
+addopts = "-v"

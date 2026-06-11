@@ -7,7 +7,6 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabEmbedding, LMHead
-from nanovllm.utils.context import set_context
 
 
 class Qwen3Attention(nn.Module):

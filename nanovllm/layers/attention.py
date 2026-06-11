@@ -37,21 +37,33 @@ class Attention(nn.Module):
         context = get_context()
 
         if context.is_prefill:
-            # prefill：单序列或 batch 统一处理
-            # 为了使用 SDPA，需要 [batch, heads, seq, head_dim] 格式
-            # Phase 2 简化为每次处理所有 token（不分 seq，不用 cu_seqlens）
-            N = q.size(0)
-            # GQA：重复 KV heads 以匹配 Q heads 数量
-            if self.num_kv_groups > 1:
-                k = k.repeat_interleave(self.num_kv_groups, dim=1)
-                v = v.repeat_interleave(self.num_kv_groups, dim=1)
-            # [1, num_heads, N, head_dim]
-            q = q.transpose(0, 1).unsqueeze(0)
-            k = k.transpose(0, 1).unsqueeze(0)
-            v = v.transpose(0, 1).unsqueeze(0)
-            o = F.scaled_dot_product_attention(q, k, v, scale=self.scale, is_causal=True)
-            # [N, num_heads, head_dim]
-            return o.squeeze(0).transpose(0, 1)
+            # 按序列边界逐条计算注意力，防止多序列 batch 时跨序列 attend 污染。
+            cu_q = context.cu_seqlens_q
+            if cu_q is None:
+                # 单序列 fallback（无 context 信息时）
+                if self.num_kv_groups > 1:
+                    k = k.repeat_interleave(self.num_kv_groups, dim=1)
+                    v = v.repeat_interleave(self.num_kv_groups, dim=1)
+                q = q.transpose(0, 1).unsqueeze(0)
+                k = k.transpose(0, 1).unsqueeze(0)
+                v = v.transpose(0, 1).unsqueeze(0)
+                o = F.scaled_dot_product_attention(q, k, v, scale=self.scale, is_causal=True)
+                return o.squeeze(0).transpose(0, 1)
+            out_parts = []
+            for s in range(cu_q.shape[0] - 1):
+                s0, s1 = cu_q[s].item(), cu_q[s + 1].item()
+                q_s = q[s0:s1]
+                k_s = k[s0:s1]
+                v_s = v[s0:s1]
+                if self.num_kv_groups > 1:
+                    k_s = k_s.repeat_interleave(self.num_kv_groups, dim=1)
+                    v_s = v_s.repeat_interleave(self.num_kv_groups, dim=1)
+                q_t = q_s.transpose(0, 1).unsqueeze(0)
+                k_t = k_s.transpose(0, 1).unsqueeze(0)
+                v_t = v_s.transpose(0, 1).unsqueeze(0)
+                o_s = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale, is_causal=True)
+                out_parts.append(o_s.squeeze(0).transpose(0, 1))
+            return torch.cat(out_parts, dim=0)
         else:
             # decode（Phase 2 不支持 KV cache，仅占位）
             raise NotImplementedError("Decode with KV cache requires Phase 3+")

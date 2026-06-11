@@ -5,21 +5,9 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
 
-# Phase 3 注意力层：扩展 Attention 以支持 KV cache（朴素版，无 FlashAttention）
 import torch.nn.functional as F
-from nanovllm.layers.attention import Attention
 from nanovllm.utils.context import get_context
-
-
-class Attention:
-    """
-    Phase 3 重新实现的 Attention，支持 KV cache 读写（无 FlashAttention，朴素实现）。
-    注：此处通过 monkey-patch 替换 nanovllm.layers.attention.Attention。
-    Phase 4 将用 FlashAttention 替换。
-    """
-    pass
 
 
 # ─── 替换注意力为支持 KV cache 的版本 ────────────────────────────────────────
@@ -29,7 +17,7 @@ import torch.nn as nn
 
 class AttentionWithKVCache(nn.Module):
     """
-    支持 KV cache 的注意力层（Phase 3，朴素实现）。
+    支持 KV cache 的注意力层（Phase 3，朴素实现，无 FlashAttention）。
 
     k_cache / v_cache：
       初始为空张量，由 ModelRunner.allocate_kv_cache 替换为全局 KV cache 的对应层切片。
@@ -71,16 +59,35 @@ class AttentionWithKVCache(nn.Module):
             self._store_kv(k, v, context.slot_mapping)
 
         if context.is_prefill:
-            # GQA 扩展
-            if self.num_kv_groups > 1:
-                k = k.repeat_interleave(self.num_kv_groups, dim=1)
-                v = v.repeat_interleave(self.num_kv_groups, dim=1)
-            # [1, num_heads, N, head_dim]
-            q_t = q.transpose(0, 1).unsqueeze(0)
-            k_t = k.transpose(0, 1).unsqueeze(0)
-            v_t = v.transpose(0, 1).unsqueeze(0)
-            o = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale, is_causal=True)
-            return o.squeeze(0).transpose(0, 1)
+            # 按序列边界逐条计算注意力，避免不同序列间的跨序列 attend 污染。
+            # is_causal=True 的下三角 mask 作用于拼接后的全局 token 序列，
+            # 若多条序列拼在一起，后序序列会 attend 到前序序列，导致 KV cache 污染。
+            cu_q = context.cu_seqlens_q  # [num_seqs+1]
+            if cu_q is None:
+                # 单序列 fallback（无 context 信息时）
+                if self.num_kv_groups > 1:
+                    k = k.repeat_interleave(self.num_kv_groups, dim=1)
+                    v = v.repeat_interleave(self.num_kv_groups, dim=1)
+                q = q.transpose(0, 1).unsqueeze(0)
+                k = k.transpose(0, 1).unsqueeze(0)
+                v = v.transpose(0, 1).unsqueeze(0)
+                o = F.scaled_dot_product_attention(q, k, v, scale=self.scale, is_causal=True)
+                return o.squeeze(0).transpose(0, 1)
+            out_parts = []
+            for s in range(cu_q.shape[0] - 1):
+                s0, s1 = cu_q[s].item(), cu_q[s + 1].item()
+                q_s = q[s0:s1]
+                k_s = k[s0:s1]
+                v_s = v[s0:s1]
+                if self.num_kv_groups > 1:
+                    k_s = k_s.repeat_interleave(self.num_kv_groups, dim=1)
+                    v_s = v_s.repeat_interleave(self.num_kv_groups, dim=1)
+                q_t = q_s.transpose(0, 1).unsqueeze(0)
+                k_t = k_s.transpose(0, 1).unsqueeze(0)
+                v_t = v_s.transpose(0, 1).unsqueeze(0)
+                o_s = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale, is_causal=True)
+                out_parts.append(o_s.squeeze(0).transpose(0, 1))
+            return torch.cat(out_parts, dim=0)
         else:
             # decode: 从 KV cache 读历史 k/v
             bs = q.size(0)
@@ -157,17 +164,24 @@ class ModelRunner:
         )
         model = Qwen3ForCausalLM(hf_config)
         # 替换所有 Attention 层为 AttentionWithKVCache
-        for module in model.modules():
-            if isinstance(module, _Qwen3Attention):
-                old_attn = module.attn
-                module.attn = AttentionWithKVCache(
-                    old_attn.num_heads, old_attn.head_dim,
-                    old_attn.scale, old_attn.num_kv_heads,
-                )
+        # 已经用monkey mock，这里不需要了
+        # for module in model.modules():
+        #     if isinstance(module, _Qwen3Attention):
+        #         old_attn = module.attn
+        #         module.attn = AttentionWithKVCache(
+        #             old_attn.num_heads, old_attn.head_dim,
+        #             old_attn.scale, old_attn.num_kv_heads,
+        #         )
         return model
 
     def warmup_model(self):
-        """运行一次最大批次 prefill，测量 GPU 峰值显存。"""
+        """
+        运行一次最大批次 prefill，测量 GPU 峰值显存。
+        Note：测到的不一定是真实峰值，只是当前给定的条件下的峰值，这里由以下三个参数影响：
+            1. max_num_batched_tokens
+            2. max_model_len
+            3. max_num_seqs
+        """
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         config = self.config

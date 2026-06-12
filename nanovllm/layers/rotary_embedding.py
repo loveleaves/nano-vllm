@@ -45,7 +45,7 @@ class RotaryEmbedding(nn.Module):
     ):
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size  # 当前实现只支持全维度旋转
+        self.rotary_dim = rotary_dim
 
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
@@ -61,14 +61,20 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,       # [N, num_heads, head_dim]
         key: torch.Tensor,         # [N, num_kv_heads, head_dim]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]          # [N, 1, head_dim]
-        cos, sin = cos_sin.chunk(2, dim=-1)              # 各 [N, 1, head_dim/2]
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+        cos_sin = self.cos_sin_cache[positions]          # [N, 1, rotary_dim]
+        cos, sin = cos_sin.chunk(2, dim=-1)              # 各 [N, 1, rotary_dim/2]
+        if self.rotary_dim < self.head_size:
+            q_rot, q_pass = query[..., :self.rotary_dim], query[..., self.rotary_dim:]
+            k_rot, k_pass = key[..., :self.rotary_dim], key[..., self.rotary_dim:]
+            query = torch.cat([apply_rotary_emb(q_rot, cos, sin), q_pass], dim=-1)
+            key   = torch.cat([apply_rotary_emb(k_rot, cos, sin), k_pass], dim=-1)
+        else:
+            query = apply_rotary_emb(query, cos, sin)
+            key   = apply_rotary_emb(key, cos, sin)
         return query, key
 
 
-@lru_cache(1)
+@lru_cache(maxsize=16)
 def get_rope(
     head_size: int,
     rotary_dim: int,

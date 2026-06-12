@@ -4,9 +4,9 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/model/Qwen3-1.7B/")
+    path = os.path.expanduser("~/model/Qwen3.5-2B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1, max_num_seqs=8)
 
     sampling_params = SamplingParams(temperature=1, max_tokens=256)
     prompts = [

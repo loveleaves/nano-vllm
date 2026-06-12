@@ -20,7 +20,7 @@ class Scheduler:
 
     def __init__(self, num_kvcache_blocks: int, block_size: int,
                  max_num_seqs: int = 512, max_num_batched_tokens: int = 16384,
-                 eos: int = -1):
+                 eos: int = -1, num_lin_attn_slots: int = 0):
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.eos = eos
@@ -28,6 +28,9 @@ class Scheduler:
         self.block_manager = BlockManager(num_kvcache_blocks, block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # 线性注意力 slot 池：每个并发序列占用一个 slot 存放 conv_state/recurrent_state
+        self.num_lin_attn_slots = num_lin_attn_slots
+        self.free_lin_attn_slots: set[int] = set(range(num_lin_attn_slots))
 
     def is_finished(self) -> bool:
         return not self.waiting and not self.running
@@ -54,10 +57,15 @@ class Scheduler:
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks == -1:
                 break
+            # 混合模型：slot 池耗尽时停止 prefill 调度（纯 Dense 模型 num_lin_attn_slots=0 跳过）
+            if self.num_lin_attn_slots > 0 and len(self.free_lin_attn_slots) == 0:
+                break
             self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = num_tokens
             num_batched_tokens += num_tokens
             seq.status = SequenceStatus.RUNNING
+            if self.free_lin_attn_slots:
+                seq.lin_attn_slot = self.free_lin_attn_slots.pop()
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)
@@ -99,3 +107,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 if seq in self.running:
                     self.running.remove(seq)
+                # 归还线性注意力 slot
+                if seq.lin_attn_slot >= 0:
+                    self.free_lin_attn_slots.add(seq.lin_attn_slot)
+                    seq.lin_attn_slot = -1

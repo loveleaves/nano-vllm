@@ -1,4 +1,5 @@
 import os
+import torch
 from dataclasses import dataclass, field
 
 
@@ -29,6 +30,7 @@ class Config:
     enforce_eager: bool = False
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    num_lin_attn_slots: int = 0   # 运行时由 ModelRunner 填入（混合模型）
     hf_config: object = field(default=None, repr=False)
     eos: int = -1
 
@@ -41,7 +43,36 @@ class Config:
         # 延迟导入 transformers，避免在纯 Python 测试中不必要的依赖
         try:
             from transformers import AutoConfig
-            self.hf_config = AutoConfig.from_pretrained(self.model)
-            self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+            try:
+                hf = AutoConfig.from_pretrained(self.model)
+            except (ValueError, KeyError):
+                # transformers 版本过旧不认识该 model_type，直接解析 config.json
+                import json
+                from types import SimpleNamespace
+                with open(os.path.join(self.model, 'config.json')) as f:
+                    cfg = json.load(f)
+                # VLM 包装：顶层 model_type='qwen3_5'，语言骨干在 text_config 下
+                if cfg.get('model_type') == 'qwen3_5' and 'text_config' in cfg:
+                    cfg = cfg['text_config']
+                # 展平 rope_parameters（含 partial_rotary_factor / rope_theta）
+                rope_params = cfg.pop('rope_parameters', {})
+                cfg.update({k: v for k, v in rope_params.items() if k not in cfg})
+                hf = SimpleNamespace(**cfg)
+
+            # AutoConfig 路径：处理 VLM 包装层
+            if getattr(hf, 'model_type', '') == 'qwen3_5':
+                hf = hf.text_config
+
+            # dtype 字符串 → torch.dtype（兼容 torch_dtype 和 dtype 字段）
+            raw_dtype = getattr(hf, 'torch_dtype', None) or getattr(hf, 'dtype', None)
+            if isinstance(raw_dtype, str):
+                resolved = getattr(torch, raw_dtype, torch.bfloat16)
+            else:
+                resolved = raw_dtype if raw_dtype is not None else torch.bfloat16
+            hf.torch_dtype = resolved
+            hf.dtype = resolved
+
+            self.hf_config = hf
+            self.max_model_len = min(self.max_model_len, hf.max_position_embeddings)
         except Exception:
             pass

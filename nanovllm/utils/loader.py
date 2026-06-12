@@ -14,34 +14,44 @@ def load_model(model: nn.Module, path: str):
     """
     从 safetensors 文件加载模型权重，支持 packed 权重名称映射。
 
-    HuggingFace 格式 → nano-vllm 格式：
-      q_proj, k_proj, v_proj → qkv_proj（QKV 拼接）
-      gate_proj, up_proj     → gate_up_proj（gate+up 拼接）
-
-    加载流程：
-      1. 遍历 *.safetensors 文件的权重名
-      2. 检查是否命中 packed_modules_mapping：
-         - 命中：重写参数名，调用 param.weight_loader(param, tensor, shard_id)
-         - 未命中：调用 param.weight_loader(param, tensor) 或 default_weight_loader
+    支持模型类属性：
+      weight_prefix_to_strip  — 剥离权重名前缀（如 VLM 的 "model.language_model."）
+      weight_skip_prefixes    — 跳过匹配前缀的权重（如 "model.visual.", "mtp."）
+      packed_modules_mapping  — HF 权重名后缀 → nano-vllm 参数名映射
     """
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    prefix_to_strip = getattr(model, "weight_prefix_to_strip", "")
+    skip_prefixes   = getattr(model, "weight_skip_prefixes", ())
+
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert files, f"没有找到 safetensors 文件：{path}"
 
     for file in files:
         with safe_open(file, framework="pt", device="cpu") as f:
             for weight_name in f.keys():
+                # 跳过视觉编码器、MTP 头等无关权重
+                if any(weight_name.startswith(p) for p in skip_prefixes):
+                    continue
+
+                # 剥离前缀得到参数路径
+                param_name = weight_name
+                if prefix_to_strip and weight_name.startswith(prefix_to_strip):
+                    param_name = weight_name[len(prefix_to_strip):]
+
                 for k in packed_modules_mapping:
-                    if k in weight_name:
+                    if k in param_name:
                         v, shard_id = packed_modules_mapping[k]
-                        param_name = weight_name.replace(k, v)
-                        param = model.get_parameter(param_name)
+                        mapped_name = param_name.replace(k, v)
+                        try:
+                            param = model.get_parameter(mapped_name)
+                        except AttributeError:
+                            break
                         loader = getattr(param, "weight_loader", default_weight_loader)
                         loader(param, f.get_tensor(weight_name), shard_id)
                         break
                 else:
                     try:
-                        param = model.get_parameter(weight_name)
+                        param = model.get_parameter(param_name)
                     except AttributeError:
                         continue
                     loader = getattr(param, "weight_loader", default_weight_loader)

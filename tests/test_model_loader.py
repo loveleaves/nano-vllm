@@ -144,6 +144,116 @@ class TestLoadModel:
         assert torch.allclose(model.b.data, wb)
 
 
+# ─── 前缀剥离 + skip_prefixes（loader 扩展功能）────────────────────────────────
+
+class TestLoaderPrefixStrip:
+
+    def _save(self, tmpdir, tensors):
+        from safetensors.torch import save_file
+        path = os.path.join(tmpdir, "model.safetensors")
+        save_file(tensors, path)
+
+    @pytest.mark.unit
+    def test_prefix_stripped_on_load(self):
+        """weight_prefix_to_strip 剥离后参数名正确匹配。"""
+        from nanovllm.utils.loader import load_model, default_weight_loader
+
+        class PrefixModel(nn.Module):
+            weight_prefix_to_strip = "model.language_model."
+            weight_skip_prefixes   = ()
+            packed_modules_mapping = {}
+
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Parameter(torch.zeros(3, 3))
+                self.fc.weight_loader = default_weight_loader
+
+        model = PrefixModel()
+        w = torch.randn(3, 3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._save(tmpdir, {"model.language_model.fc": w})
+            load_model(model, tmpdir)
+        assert torch.allclose(model.fc.data, w)
+
+    @pytest.mark.unit
+    def test_skip_prefixes_not_loaded(self):
+        """skip_prefixes 命中的权重不写入模型，其余参数正常加载。"""
+        from nanovllm.utils.loader import load_model, default_weight_loader
+
+        class SkipModel(nn.Module):
+            weight_prefix_to_strip = ""
+            weight_skip_prefixes   = ("model.visual.", "mtp.")
+            packed_modules_mapping = {}
+
+            def __init__(self):
+                super().__init__()
+                self.lm = nn.Parameter(torch.zeros(2, 2))
+                self.lm.weight_loader = default_weight_loader
+
+        model = SkipModel()
+        lm_w = torch.ones(2, 2) * 5
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._save(tmpdir, {
+                "lm": lm_w,
+                "model.visual.patch": torch.randn(4, 4),
+                "mtp.head": torch.randn(4, 4),
+            })
+            load_model(model, tmpdir)
+        assert torch.allclose(model.lm.data, lm_w)
+
+    @pytest.mark.unit
+    def test_no_prefix_strip_unchanged(self):
+        """weight_prefix_to_strip='' 时行为与旧版本完全一致。"""
+        from nanovllm.utils.loader import load_model, default_weight_loader
+
+        class PlainModel(nn.Module):
+            weight_prefix_to_strip = ""
+            weight_skip_prefixes   = ()
+            packed_modules_mapping = {}
+
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(2, 2))
+                self.w.weight_loader = default_weight_loader
+
+        model = PlainModel()
+        data = torch.randn(2, 2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._save(tmpdir, {"w": data})
+            load_model(model, tmpdir)
+        assert torch.allclose(model.w.data, data)
+
+    @pytest.mark.unit
+    def test_prefix_strip_with_packed_mapping(self):
+        """前缀剥离后仍能正确触发 packed_modules_mapping。"""
+        from nanovllm.utils.loader import load_model
+        from nanovllm.layers.linear import MergedColumnParallelLinear
+
+        class PrefixPackedModel(nn.Module):
+            weight_prefix_to_strip = "lm."
+            weight_skip_prefixes   = ()
+            packed_modules_mapping = {
+                "gate_proj": ("gate_up_proj", 0),
+                "up_proj":   ("gate_up_proj", 1),
+            }
+
+            def __init__(self):
+                super().__init__()
+                self.gate_up_proj = MergedColumnParallelLinear(4, [4, 4])
+
+        model = PrefixPackedModel()
+        gate_w = torch.ones(4, 4)
+        up_w   = torch.ones(4, 4) * 2
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from safetensors.torch import save_file
+            save_file({"lm.gate_proj.weight": gate_w,
+                       "lm.up_proj.weight": up_w},
+                      os.path.join(tmpdir, "model.safetensors"))
+            load_model(model, tmpdir)
+        assert torch.allclose(model.gate_up_proj.weight.data[:4], gate_w)
+        assert torch.allclose(model.gate_up_proj.weight.data[4:], up_w)
+
+
 # ─── GPU 集成测试（需真实 Qwen3 权重） ─────────────────────────────────────────
 
 

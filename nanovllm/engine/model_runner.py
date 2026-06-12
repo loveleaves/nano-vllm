@@ -151,28 +151,24 @@ class ModelRunner:
         load_model(self.model, config.model)
         self.sampler = Sampler()
 
+        # 线性注意力状态在 warmup 前分配，使峰值显存测量包含状态开销
+        self._allocate_lin_attn_states()
         self.warmup_model()
         self.allocate_kv_cache()
+        # warmup 会写入状态，重置为 0 供正式推理使用
+        self._reset_lin_attn_states()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
     def _build_model(self, hf_config):
-        """构建模型，并将所有 Attention 层替换为 AttentionWithKVCache。"""
-        from nanovllm.models.qwen3 import (
-            Qwen3ForCausalLM, Qwen3Attention as _Qwen3Attention,
-        )
-        model = Qwen3ForCausalLM(hf_config)
-        # 替换所有 Attention 层为 AttentionWithKVCache
-        # 已经用monkey mock，这里不需要了
-        # for module in model.modules():
-        #     if isinstance(module, _Qwen3Attention):
-        #         old_attn = module.attn
-        #         module.attn = AttentionWithKVCache(
-        #             old_attn.num_heads, old_attn.head_dim,
-        #             old_attn.scale, old_attn.num_kv_heads,
-        #         )
-        return model
+        """根据 model_type 构建对应模型。monkey-patch 已在模块级注入 AttentionWithKVCache。"""
+        model_type = getattr(hf_config, 'model_type', '')
+        if model_type == 'qwen3_5_text':
+            from nanovllm.models.qwen35 import Qwen35ForCausalLM
+            return Qwen35ForCausalLM(hf_config)
+        from nanovllm.models.qwen3 import Qwen3ForCausalLM
+        return Qwen3ForCausalLM(hf_config)
 
     def warmup_model(self):
         """
@@ -188,13 +184,14 @@ class ModelRunner:
         seq_len = min(config.max_num_batched_tokens, config.max_model_len)
         num_seqs = min(config.max_num_batched_tokens // seq_len, config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        for seq in seqs:
+        for i, seq in enumerate(seqs):
             seq.num_scheduled_tokens = seq_len
+            seq.lin_attn_slot = i   # 为 warmup 分配临时 slot
         self._run_prefill_eager(seqs)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
-        """根据剩余显存计算并分配 KV cache 张量。"""
+        """根据剩余显存计算并分配 KV cache 张量（仅分配 full_attention 层）。"""
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
@@ -204,7 +201,15 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads
         head_dim = getattr(hf_config, "head_dim",
                            hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = (2 * hf_config.num_hidden_layers * self.block_size *
+
+        # 混合架构：只为 full_attention 层分配 KV cache
+        layer_types = getattr(hf_config, 'layer_types', None)
+        num_kv_layers = (
+            sum(1 for t in layer_types if t == 'full_attention')
+            if layer_types else hf_config.num_hidden_layers
+        )
+
+        block_bytes = (2 * num_kv_layers * self.block_size *
                        num_kv_heads * head_dim * hf_config.dtype.itemsize)
         config.num_kvcache_blocks = int(
             total * config.gpu_memory_utilization - used - peak + current
@@ -212,16 +217,36 @@ class ModelRunner:
         assert config.num_kvcache_blocks > 0, "显存不足以分配 KV cache"
 
         self.kv_cache = torch.empty(
-            2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
+            2, num_kv_layers, config.num_kvcache_blocks,
             self.block_size, num_kv_heads, head_dim,
         )
-        # 将 kv_cache 各层切片绑定到对应 AttentionWithKVCache 模块
+        # 将 kv_cache 各层切片绑定到对应 AttentionWithKVCache 模块（跳过 GDN）
         layer_id = 0
         for module in self.model.modules():
             if isinstance(module, AttentionWithKVCache):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    def _allocate_lin_attn_states(self):
+        """为每个 GatedDeltaNet 层按 config.max_num_seqs 分配状态池。"""
+        from nanovllm.models.qwen35 import GatedDeltaNet
+        gdn_modules = [m for m in self.model.modules() if isinstance(m, GatedDeltaNet)]
+        if not gdn_modules:
+            return
+
+        num_slots = self.config.max_num_seqs
+        self.config.num_lin_attn_slots = num_slots
+        for m in gdn_modules:
+            m.allocate_states(num_slots)
+
+    def _reset_lin_attn_states(self):
+        """warmup 后将状态张量重置为 0，确保推理从干净状态开始。"""
+        from nanovllm.models.qwen35 import GatedDeltaNet
+        for module in self.model.modules():
+            if isinstance(module, GatedDeltaNet):
+                module.conv_state.zero_()
+                module.recurrent_state.zero_()
 
     def _run_prefill_eager(self, seqs: list[Sequence]):
         """准备 prefill 输入并执行 forward（不采样）。"""
@@ -266,7 +291,9 @@ class ModelRunner:
         cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32).cuda()
         cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32).cuda()
         sm = torch.tensor(slot_mapping, dtype=torch.int32).cuda() if slot_mapping else None
-        set_context(True, cu_q, cu_k, max_seqlen_q, max_seqlen_k, sm)
+        lin_slots = [seq.lin_attn_slot for seq in seqs]
+        set_context(True, cu_q, cu_k, max_seqlen_q, max_seqlen_k, sm,
+                    lin_attn_seq_slots=lin_slots)
         with torch.inference_mode():
             hidden = self.model(input_ids, positions)
         reset_context()
@@ -314,7 +341,9 @@ class ModelRunner:
         cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         sm = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_q, cu_k, max_seqlen_q, max_seqlen_k, sm)
+        lin_slots = [seq.lin_attn_slot for seq in seqs]
+        set_context(True, cu_q, cu_k, max_seqlen_q, max_seqlen_k, sm,
+                    lin_attn_seq_slots=lin_slots)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -338,7 +367,9 @@ class ModelRunner:
         max_len = max(len(seq.block_table) for seq in seqs)
         bt = [[*seq.block_table, *[-1] * (max_len - len(seq.block_table))] for seq in seqs]
         bt = torch.tensor(bt, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt)
+        lin_slots = [seq.lin_attn_slot for seq in seqs]
+        set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt,
+                    lin_attn_seq_slots=lin_slots)
         return input_ids, positions
 
     @torch.inference_mode()

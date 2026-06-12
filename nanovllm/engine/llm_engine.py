@@ -37,6 +37,7 @@ class LLMEngine:
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
             eos=config.eos,
+            num_lin_attn_slots=config.num_lin_attn_slots,  # ModelRunner 已按可用显存计算
         )
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):

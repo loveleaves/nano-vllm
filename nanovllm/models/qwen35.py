@@ -38,23 +38,25 @@ def _recurrent_step(
     q: torch.Tensor,       # [nk, dk]
     k: torch.Tensor,       # [nk, dk]  L2-normalized
     v: torch.Tensor,       # [nv, dv]
-    g: torch.Tensor,       # [nk]  负值，exp(g) 为衰减因子
-    beta: torch.Tensor,    # [nk]  已 sigmoid，更新率
+    g: torch.Tensor,       # [nv]  负值，exp(g) 为衰减因子（已是 nv-sized）
+    beta: torch.Tensor,    # [nv]  已 sigmoid，更新率（已是 nv-sized）
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """单步 GatedDeltaNet 递推，返回 (out [nv, dv], new_state [nv, dk, dv])。"""
+    """单步 GatedDeltaNet 递推，返回 (out [nv, dv], new_state [nv, dk, dv])。
+    g/beta 已是 nv-sized，只扩展 k（和 q）以匹配 nv。
+    """
     nv, dk, dv = state.shape
     nk = k.shape[0]
 
-    # GQA：当 nv > nk 时扩展 k/g/beta
+    # GQA：当 nv > nk 时只扩展 k 和 q，g/beta 已经是 nv-sized
     if nv > nk:
         ratio = nv // nk
-        k    = k.repeat_interleave(ratio, dim=0)
-        g    = g.repeat_interleave(ratio)
-        beta = beta.repeat_interleave(ratio)
+        k   = k.repeat_interleave(ratio, dim=0)
+        q_f = q.float().repeat_interleave(ratio, dim=0)
+    else:
+        q_f = q.float()
 
     k_f = k.float()
     v_f = v.float()
-    q_f = q.float() if nv == nk else q.repeat_interleave(nv // nk, dim=0).float()
 
     # 状态衰减：state[v] *= exp(g[v])
     state = state * g.exp()[:, None, None]
@@ -104,8 +106,8 @@ class GatedDeltaNet(nn.Module):
         # 投影层（与 vllm qwen3_next.py 命名一致）
         self.in_proj_qkv = ColumnParallelLinear(hidden, conv_dim, bias=False)
         self.in_proj_z   = ColumnParallelLinear(hidden, nv * dv, bias=False)
-        self.in_proj_b   = ColumnParallelLinear(hidden, nk, bias=False)   # beta
-        self.in_proj_a   = ColumnParallelLinear(hidden, nk, bias=False)   # dt a
+        self.in_proj_b   = ColumnParallelLinear(hidden, nv, bias=False)   # beta，维度为 nv
+        self.in_proj_a   = ColumnParallelLinear(hidden, nv, bias=False)   # dt a，维度为 nv
 
         # causal conv，bias=False（与实际权重文件一致）
         self.conv1d = nn.Conv1d(conv_dim, conv_dim, kernel,
@@ -115,9 +117,9 @@ class GatedDeltaNet(nn.Module):
         self.norm     = RMSNorm(dv, eps=config.rms_norm_eps)
         self.out_proj = RowParallelLinear(nv * dv, hidden, bias=False)
 
-        # SSM 可学习参数（float32 精度）
-        self.A_log   = nn.Parameter(torch.empty(nk))
-        self.dt_bias = nn.Parameter(torch.empty(nk))
+        # SSM 可学习参数（float32 精度），维度为 nv（35B: nv=32≠nk=16；2B: nk=nv=16 无差别）
+        self.A_log   = nn.Parameter(torch.empty(nv))
+        self.dt_bias = nn.Parameter(torch.empty(nv))
 
         # 状态张量（由 ModelRunner 注入）
         self.conv_state: torch.Tensor = torch.empty(0)

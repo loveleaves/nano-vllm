@@ -167,6 +167,9 @@ class ModelRunner:
         if model_type == 'qwen3_5_text':
             from nanovllm.models.qwen35 import Qwen35ForCausalLM
             return Qwen35ForCausalLM(hf_config)
+        if model_type == 'qwen3_5_moe_text':
+            from nanovllm.models.qwen35_moe import Qwen35MoEForCausalLM
+            return Qwen35MoEForCausalLM(hf_config)
         from nanovllm.models.qwen3 import Qwen3ForCausalLM
         return Qwen3ForCausalLM(hf_config)
 
@@ -208,6 +211,12 @@ class ModelRunner:
             sum(1 for t in layer_types if t == 'full_attention')
             if layer_types else hf_config.num_hidden_layers
         )
+
+        if num_kv_layers == 0:
+            # 纯线性注意力模型（如减层 MoE），无需 KV cache
+            config.num_kvcache_blocks = 0
+            self.kv_cache = torch.empty(0)
+            return
 
         block_bytes = (2 * num_kv_layers * self.block_size *
                        num_kv_heads * head_dim * hf_config.dtype.itemsize)

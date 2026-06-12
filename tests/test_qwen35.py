@@ -171,7 +171,13 @@ class TestGatedDeltaNet:
 
     def _make_gdn(self):
         from nanovllm.models.qwen35 import GatedDeltaNet
-        return GatedDeltaNet(FakeQwen35Config())
+        gdn = GatedDeltaNet(FakeQwen35Config())
+        # GDN 参数用 torch.empty 创建（生产中由权重文件填充），测试必须显式
+        # 初始化，否则未初始化内存中的极端值会导致衰减为 0 / beta≈0 等假象
+        with torch.no_grad():
+            for p in gdn.parameters():
+                p.normal_(0, 0.02)
+        return gdn
 
     @pytest.mark.unit
     def test_allocate_states_shapes(self):

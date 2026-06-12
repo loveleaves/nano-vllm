@@ -51,8 +51,8 @@ class Config:
                 from types import SimpleNamespace
                 with open(os.path.join(self.model, 'config.json')) as f:
                     cfg = json.load(f)
-                # VLM 包装：顶层 model_type='qwen3_5'，语言骨干在 text_config 下
-                if cfg.get('model_type') == 'qwen3_5' and 'text_config' in cfg:
+                # VLM 包装：顶层 model_type='qwen3_5'/'qwen3_5_moe'，语言骨干在 text_config 下
+                if cfg.get('model_type') in ('qwen3_5', 'qwen3_5_moe') and 'text_config' in cfg:
                     cfg = cfg['text_config']
                 # 展平 rope_parameters（含 partial_rotary_factor / rope_theta）
                 rope_params = cfg.pop('rope_parameters', {})
@@ -60,7 +60,7 @@ class Config:
                 hf = SimpleNamespace(**cfg)
 
             # AutoConfig 路径：处理 VLM 包装层
-            if getattr(hf, 'model_type', '') == 'qwen3_5':
+            if getattr(hf, 'model_type', '') in ('qwen3_5', 'qwen3_5_moe'):
                 hf = hf.text_config
 
             # dtype 字符串 → torch.dtype（兼容 torch_dtype 和 dtype 字段）

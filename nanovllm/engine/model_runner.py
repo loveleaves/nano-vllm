@@ -190,7 +190,7 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self._run_prefill_eager(seqs)
+        self.run(seqs, True)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -222,55 +222,6 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
-
-    def _run_prefill_eager(self, seqs: list[Sequence]):
-        """准备 prefill 输入并执行 forward（不采样）。"""
-        input_ids_list = []
-        positions_list = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
-
-        for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
-            end = start + seqlen_q
-            seqlen_k = end
-
-            input_ids_list.extend(seq[start:end] if seq.token_ids else [0] * seqlen_q)
-            positions_list.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-
-            if not seq.block_table:
-                slot_mapping.extend([-1] * seqlen_q)
-                continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
-
-        input_ids = torch.tensor(input_ids_list, dtype=torch.int64).cuda()
-        positions = torch.tensor(positions_list, dtype=torch.int64).cuda()
-        cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32).cuda()
-        cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32).cuda()
-        sm = torch.tensor(slot_mapping, dtype=torch.int32).cuda() if slot_mapping else None
-        set_context(True, cu_q, cu_k, max_seqlen_q, max_seqlen_k, sm)
-        with torch.inference_mode():
-            hidden = self.model(input_ids, positions)
-        reset_context()
-        return hidden
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids_list = []

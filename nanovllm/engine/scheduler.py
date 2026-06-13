@@ -80,6 +80,15 @@ class Scheduler:
             self.block_manager.may_append(seq)
             scheduled_seqs.append(seq)
 
+        # 阶段一无抢占：若 running 非空却一个都排不进（队首就缺块），
+        # 后续步也不可能腾出空间（没有 seq 能 decode 进而结束），会陷入死循环。
+        # 这里直接报错而非静默空转，便于定位「KV cache 不足」。
+        if not scheduled_seqs and self.running:
+            raise RuntimeError(
+                "KV cache 不足以继续 decode，且当前阶段未实现抢占；"
+                "请调大 gpu_memory_utilization 或减小 max_num_seqs / max_model_len。"
+            )
+
         return scheduled_seqs, False
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):

@@ -95,11 +95,12 @@ class BlockManager:
     def can_append(self, seq: Sequence) -> bool:
         """
         检查 decode 步是否有足够空闲块追加。
-        仅当 seq 当前最后一 token 恰好填满一个块时，才需要新分配一个块。
+        仅当 seq 最后一个 token 恰好是某个新块的第一个 token
+        （即上一块刚被填满、需要开新块）时，才需要新分配一个块。
         """
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
-        """decode 步按需分配新块（当前序列长度对 block_size 取余为 1 时分配）。"""
+        """decode 步按需分配新块（最后一 token 为新块首 token，即 len % block_size == 1 时分配）。"""
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())

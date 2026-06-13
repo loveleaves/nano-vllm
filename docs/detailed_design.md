@@ -156,6 +156,7 @@ blocks         : list[Block]  # 所有块（下标 = block_id）
 | `deallocate(seq)` | 释放所有块，清空 block_table | 同，但保留 hash |
 | `can_append(seq)` | bool：decode 时是否有空闲块 | 同 |
 | `may_append(seq)` | 按需分配新块（块满时） | 同 |
+| `hash_blocks(seq)` | （不存在） | postprocess 时注册本步新填满块的哈希 |
 
 ### 3.6 Scheduler（调度器）
 
@@ -218,11 +219,9 @@ def may_append(seq) -> None
 
 ---
 
----
+## 5. Phase 2：神经网络层
 
-## 6. Phase 2：神经网络层
-
-### 6.1 Context（推理上下文）
+### 5.1 Context（推理上下文）
 
 **设计目标**：将单步推理的元数据（序列长度、slot 映射、KV 表）以全局变量隐式传递，避免每层手动传参。
 
@@ -241,7 +240,7 @@ class Context:
 
 **线程安全性**：当前实现使用进程级全局变量，单 GPU 进程内线程安全；多进程 TP 场景下每个进程各自维护独立 Context。
 
-### 6.2 RMSNorm（均方根归一化）
+### 5.2 RMSNorm（均方根归一化）
 
 **公式**：$\text{RMSNorm}(x) = \frac{x}{\sqrt{\text{mean}(x^2) + \epsilon}} \cdot w$
 
@@ -258,14 +257,14 @@ def forward(self, x, residual=None):
     return self.add_rms_forward(x, residual) # 中间层（融合路径）
 ```
 
-### 6.3 RotaryEmbedding（旋转位置编码）
+### 5.3 RotaryEmbedding（旋转位置编码）
 
 **实现要点**：
 - `cos_sin_cache [max_pos, 1, head_dim]`：预计算全部位置的旋转系数，inference 时按位置索引
 - `get_rope(head_dim, rotary_dim, max_position, base)` 使用 `@lru_cache`：所有层共享同一实例
 - 旋转在 `float32` 精度下进行，保持数值精度
 
-### 6.4 线性层族（Linear Layer Family）
+### 5.4 线性层族（Linear Layer Family）
 
 **TP 分片方案**：
 
@@ -281,7 +280,7 @@ def forward(self, x, residual=None):
 - 每个参数上注册 `weight_loader` 函数属性，供 `loader.py` 调用
 - TP=1 时等价于普通线性层，TP>1 时自动切片
 
-### 6.5 Attention（注意力机制）
+### 5.5 Attention（注意力机制）
 
 **Phase 2（SDPA）**：使用 `torch.nn.functional.scaled_dot_product_attention` 实现 prefill，causal mask 通过 `is_causal=True` 自动应用。
 
@@ -291,11 +290,18 @@ def forward(self, x, residual=None):
 - Decode：从 cache 读取历史 KV，做单步 decode attention
 
 **Phase 4（FlashAttention + Triton）**：
-- Prefill：`flash_attn_varlen_func`（变长序列）
+- Prefill：`flash_attn_varlen_func`（变长序列；前缀缓存命中时传 `block_table`，
+  以 KV cache 为 K/V 来源，`cu_seqlens_k > cu_seqlens_q` 表达历史长度）
 - Decode：`flash_attn_with_kvcache`（分页 KV cache 直接索引）
 - KV 写入：Triton `store_kvcache_kernel`（向量化 scatter，支持非连续 slot mapping）
 
-### 6.6 Sampler（采样器）
+**Fallback 路径**（flash-attn / Triton 不可用或张量在 CPU 上时，主要服务于 CPU 单元测试）：
+- Prefill 退回 SDPA（`_sdpa_prefill`）：按 `cu_seqlens` 逐序列独立计算（避免跨序列
+  attend 污染）；`cu_seqlens_k > cu_seqlens_q` 时从 KV cache 收集历史前缀，
+  causal mask 右下对齐
+- Decode 退回逐 seq 从 cache gather 后 SDPA，KV 写入退回 Python scatter
+
+### 5.6 Sampler（采样器）
 
 **Gumbel-max 技巧**（等价于按概率采样）：
 ```python
@@ -306,7 +312,7 @@ sample = argmax(probs / Exponential(1))   # 等价于 Gumbel 扰动后 argmax
 
 **Phase 4 `@torch.compile`**：将整个采样计算图编译为单个 kernel，消除 Python 开销。
 
-### 6.7 Qwen3 模型架构
+### 5.7 Qwen3 模型架构
 
 ```
 Qwen3ForCausalLM
@@ -341,9 +347,9 @@ Qwen3ForCausalLM
 
 ---
 
-## 7. Phase 3：权重加载与推理流水线
+## 6. Phase 3：权重加载与推理流水线
 
-### 7.1 权重加载（load_model）
+### 6.1 权重加载（load_model）
 
 **加载流程**：
 ```
@@ -361,7 +367,7 @@ for each .safetensors file（排序后顺序读取）:
 - `safetensors` 格式：lazy mmap 读取，不一次性加载所有权重到 CPU 内存
 - `weight_loader` 函数属性：参数级别的自定义加载逻辑，TP 切片对上层透明
 
-### 7.2 ModelRunner（执行器）
+### 6.2 ModelRunner（执行器）
 
 **职责**：
 1. 初始化 NCCL 进程组（Phase 4），设置 CUDA 设备
@@ -381,7 +387,7 @@ available = total * gpu_memory_utilization - used - peak + current
 num_blocks = available // block_bytes
 ```
 
-### 7.3 推理流水线
+### 6.3 推理流水线
 
 **Prefill 路径**：
 ```
@@ -403,9 +409,9 @@ sampler(logits, temperatures) → token_ids
 
 ---
 
-## 8. Phase 4：工程优化
+## 7. Phase 4：工程优化
 
-### 8.1 前缀缓存（Prefix Caching）
+### 7.1 前缀缓存（Prefix Caching）
 
 **算法**：链式 xxhash
 ```python
@@ -422,14 +428,20 @@ hash(block_i) = xxhash(tokens_in_block_i + prev_block_hash)
 - 释放时不立即删除哈希，延迟到物理块被复用时清理
 - `_allocate_block` 复用已有哈希块时，主动删除旧哈希避免脏命中
 
-### 8.2 Chunked Prefill
+**哈希注册时机（`hash_blocks`）**：
+- `Scheduler.postprocess` 在每步推理后调用，对 `[num_cached_tokens,
+  num_cached_tokens + num_scheduled_tokens)` 范围内**新填满**的块计算并注册哈希
+- 链式起点取前一块已记录的 `hash`（首块为 -1）；末尾未满块跳过，等填满后再注册
+- 因此 prefill 各 chunk、decode 跨块边界时都会增量注册，无需一次性扫描
+
+### 7.2 Chunked Prefill
 
 **策略**：
 - 只允许 waiting 队列的第一个 seq 分块（避免其他 seq 饥饿）
 - `num_scheduled_tokens = min(num_remaining_tokens, budget_remaining)`
 - 分块中途不追加新 token（`postprocess` 中通过 `num_cached_tokens < num_tokens` 判断）
 
-### 8.3 张量并行（Tensor Parallelism）
+### 7.3 张量并行（Tensor Parallelism）
 
 **进程通信**：
 ```
@@ -443,19 +455,23 @@ rank 0（主进程）─── NCCL all_reduce ───→ rank 1..N
 - ColumnParallel: `weight[out/N*rank : out/N*(rank+1), :]`
 - RowParallel: `weight[:, in/N*rank : in/N*(rank+1)]`
 
-### 8.4 CUDA Graph
+### 7.4 CUDA Graph
 
 **录制策略**：
-- batch sizes = [1, 2, 4, 8, 16, 32, ..., 512]
-- 从大到小录制，第一次创建 memory pool，后续共享（减少碎片）
-- 静态张量：prefill 时数据变化 → 录制前更新静态 buffer，replay 时直接使用
+- batch sizes = [1, 2, 4, 8] + [16, 32, 48, ..., 512]（16 起步长 16，上限 min(max_num_seqs, 512)）
+- 从大到小录制，第一个 graph 创建 memory pool，后续 graph 共享（减少显存碎片）
+- 静态张量（input_ids / positions / slot_mapping / context_lens / block_tables / outputs）
+  在录制时被 graph 绑定地址；replay 前将本步数据写入这些 buffer，`graph.replay()` 后从
+  `outputs[:bs]` 读结果
+- 实际 bs 向上取整到最近的 graph_bs；padding 行 slot_mapping=-1（跳过 KV 写入）、
+  context_lens=0（不读 cache），其输出丢弃
 
 **适用条件**：
 - 仅用于 decode 阶段（形状固定）
 - batch size ≤ 512（超过则 eager）
 - `enforce_eager=True` 时禁用
 
-### 8.5 FlashAttention 与 Triton
+### 7.5 FlashAttention 与 Triton
 
 **Prefill**：`flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)`
 - 输入为打平的变长序列，自动处理多 seq batch
@@ -466,23 +482,39 @@ rank 0（主进程）─── NCCL all_reduce ───→ rank 1..N
 **Triton KV 写入**：
 ```python
 @triton.jit
-def store_kvcache_kernel(q, k, v, k_cache, v_cache, slot_mapping, ...):
-    # 向量化 scatter：slot_mapping → 物理 slot
-    # 绕过 Python 的 for-loop，HBM 带宽利用率更高
+def store_kvcache_kernel(key_ptr, key_stride, value_ptr, value_stride,
+                         k_cache_ptr, v_cache_ptr, slot_mapping_ptr, D):
+    # 每个 program 处理一个 token：slot = slot_mapping[i]
+    # slot == -1 跳过（CUDA graph padding 行）
+    # 向量化读写 D = num_kv_heads * head_dim 个元素
 ```
+
+### 7.6 已知限制
+
+| 限制 | 影响范围 | 说明 |
+|------|---------|------|
+| SDPA prefill fallback 逐序列 Python 循环 + cache gather，性能远低于 flash 路径 | 仅 fallback 路径 | 定位是 CPU 单测与无 flash-attn 环境的正确性兜底，不做性能优化 |
+| Chunked prefill 在首个 chunk 即为整个 prompt 分配全部 KV 块 | 长 prompt 提前占用显存 | 以简洁换内存：避免逐 chunk 增量分配的复杂度 |
+| GQA 下要求 `num_kv_heads % tp_size == 0` | TP 并行度受 KV head 数限制 | 与上游 nano-vllm 一致，不做 KV head 复制 |
+
+> 历史问题（已修复）：早期 Attention 仅按 `HAS_FLASH_ATTN` 分发未检查张量设备
+> （装有 flash-attn 的机器上 CPU 单测误走 CUDA-only 路径失败），且 SDPA prefill
+> fallback 把多序列 batch 当单条序列做 causal attention（跨序列泄漏，phase3 分支
+> 25b07bd 同源问题）、不读 KV cache 历史前缀。现分发已改为
+> `HAS_FLASH_ATTN and q.is_cuda`，fallback 改为 `_sdpa_prefill` 逐序列计算并支持前缀读取。
 
 ---
 
-## 9. 测试策略
+## 8. 测试策略
 
-### 9.1 测试分层
+### 8.1 测试分层
 
 | 层次 | pytest 标记 | 环境 | 目标 |
 |------|------------|------|------|
 | 单元测试 | `@pytest.mark.unit` | CPU，CI 自动 | 算法正确性、边界条件 |
 | 集成测试 | `@pytest.mark.gpu` | GPU + 权重 | 端到端推理质量 |
 
-### 9.2 测试文件组织（按功能分类）
+### 8.2 测试文件组织（按功能分类）
 
 | 文件 | 覆盖组件 | 阶段 |
 |------|---------|------|
@@ -501,7 +533,10 @@ def store_kvcache_kernel(q, k, v, k_cache, v_cache, slot_mapping, ...):
 | `test_qwen3.py` | Qwen3ForCausalLM 结构 | Phase 2 |
 | `test_model_loader.py` | 权重加载（packed + default）| Phase 3 |
 
-### 9.3 运行命令
+> 注：attention / qwen3 的单元测试在 CPU 上覆盖 SDPA fallback 路径；
+> 分发同时检查 `HAS_FLASH_ATTN` 与 `q.is_cuda`，装有 flash-attn 的机器上 CPU 单测同样可过。
+
+### 8.3 运行命令
 
 ```bash
 # CI（仅单元测试，无需 GPU）

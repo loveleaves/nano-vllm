@@ -101,6 +101,7 @@ class Attention(nn.Module):
     forward 分两路：
       prefill: flash_attn_varlen_func（可变长，causal）
       decode:  flash_attn_with_kvcache（分页读 KV cache）
+    flash-attn 不可用或张量在 CPU 上时退回 SDPA（逐序列计算，见 _sdpa_prefill）。
 
     KV 写入在注意力计算前执行，确保当前 token 参与自注意力。
     """
@@ -131,7 +132,7 @@ class Attention(nn.Module):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
-            if HAS_FLASH_ATTN:
+            if HAS_FLASH_ATTN and q.is_cuda:
                 if context.block_tables is not None:
                     # 有前缀缓存，从 KV cache 读历史
                     k_fa, v_fa = k_cache, v_cache
@@ -148,17 +149,10 @@ class Attention(nn.Module):
                     block_table=context.block_tables,
                 )
             else:
-                # FlashAttention 不可用，退回 SDPA
-                if self.num_kv_groups > 1:
-                    k = k.repeat_interleave(self.num_kv_groups, dim=1)
-                    v = v.repeat_interleave(self.num_kv_groups, dim=1)
-                q_t = q.transpose(0, 1).unsqueeze(0)
-                k_t = k.transpose(0, 1).unsqueeze(0)
-                v_t = v.transpose(0, 1).unsqueeze(0)
-                o = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale, is_causal=True)
-                o = o.squeeze(0).transpose(0, 1)
+                # FlashAttention 不可用/非 CUDA，退回 SDPA
+                o = self._sdpa_prefill(q, k, v, k_cache, v_cache, context)
         else:
-            if HAS_FLASH_ATTN:
+            if HAS_FLASH_ATTN and q.is_cuda:
                 # q: [bs, num_heads, head_dim] → [bs, 1, num_heads, head_dim]
                 o = flash_attn_with_kvcache(
                     q.unsqueeze(1), k_cache, v_cache,
@@ -193,3 +187,53 @@ class Attention(nn.Module):
                 o = torch.stack(outputs, dim=0)
 
         return o
+
+    def _sdpa_prefill(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                      k_cache: torch.Tensor, v_cache: torch.Tensor, context) -> torch.Tensor:
+        """
+        SDPA prefill fallback（FlashAttention 不可用或张量在 CPU 上时）。
+
+        按 cu_seqlens 逐序列独立计算：is_causal 的下三角 mask 作用于拼接后的
+        全局 token 序列，多序列拼 batch 时后序序列会 attend 到前序序列（跨序列污染），
+        必须按序列边界切开。
+
+        seqlen_k > seqlen_q（前缀缓存命中 / chunked prefill 续算）时，
+        历史 K/V 从 KV cache 收集（本步 K/V 已先写入 cache），
+        causal mask 按右下对齐：query i 可见 key j ≤ i + (seqlen_k - seqlen_q)。
+        """
+        cu_q = context.cu_seqlens_q
+        if cu_q is None:
+            # 无 cu_seqlens 信息：当作单序列处理
+            cu_q = torch.tensor([0, q.size(0)])
+        cu_k = context.cu_seqlens_k if context.cu_seqlens_k is not None else cu_q
+        outputs = []
+        for s in range(cu_q.numel() - 1):
+            q0, q1 = cu_q[s].item(), cu_q[s + 1].item()
+            seqlen_q = q1 - q0
+            seqlen_k = cu_k[s + 1].item() - cu_k[s].item()
+            q_s = q[q0:q1]
+            if seqlen_k > seqlen_q:
+                # 历史前缀在 KV cache 中，按 block_table 收集完整 K/V
+                block_size = k_cache.shape[1]
+                num_blocks = (seqlen_k + block_size - 1) // block_size
+                blocks = context.block_tables[s, :num_blocks]
+                k_s = torch.cat([k_cache[b] for b in blocks], dim=0)[:seqlen_k]
+                v_s = torch.cat([v_cache[b] for b in blocks], dim=0)[:seqlen_k]
+            else:
+                k_s, v_s = k[q0:q1], v[q0:q1]
+            if self.num_kv_groups > 1:
+                k_s = k_s.repeat_interleave(self.num_kv_groups, dim=1)
+                v_s = v_s.repeat_interleave(self.num_kv_groups, dim=1)
+            q_t = q_s.transpose(0, 1).unsqueeze(0)
+            k_t = k_s.transpose(0, 1).unsqueeze(0)
+            v_t = v_s.transpose(0, 1).unsqueeze(0)
+            if seqlen_k > seqlen_q:
+                mask = torch.ones(seqlen_q, seqlen_k, dtype=torch.bool,
+                                  device=q.device).tril(seqlen_k - seqlen_q)
+                o_s = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t, scale=self.scale, attn_mask=mask)
+            else:
+                o_s = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t, scale=self.scale, is_causal=True)
+            outputs.append(o_s.squeeze(0).transpose(0, 1))
+        return torch.cat(outputs, dim=0)

@@ -10,26 +10,15 @@ class Block:
     字段：
       block_id  — 物理块编号
       ref_count — 引用计数；为 0 时可被回收
-      hash      — 该块 token 序列的链式哈希（-1 表示未哈希）
-      token_ids — 存储的 token 序列（用于哈希碰撞校验）
     """
 
     def __init__(self, block_id: int):
         self.block_id = block_id
         self.ref_count = 0
-        self.hash = -1
-        self.token_ids: list[int] = []
-
-    def update(self, h: int, token_ids: list[int]):
-        """prefill 后记录本块的内容哈希，供前缀缓存使用。"""
-        self.hash = h
-        self.token_ids = token_ids
 
     def reset(self):
         """分配给新 seq 前清零状态（ref_count 置 1）。"""
         self.ref_count = 1
-        self.hash = -1
-        self.token_ids = []
 
 
 class BlockManager:

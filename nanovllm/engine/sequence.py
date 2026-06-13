@@ -67,10 +67,6 @@ class Sequence:
         return self.num_tokens - self.num_prompt_tokens
 
     @property
-    def prompt_token_ids(self) -> list[int]:
-        return self.token_ids[:self.num_prompt_tokens]
-
-    @property
     def completion_token_ids(self) -> list[int]:
         return self.token_ids[self.num_prompt_tokens:]
 
@@ -84,32 +80,8 @@ class Sequence:
         """最后一个逻辑块中已使用的 token 数（1~block_size）。"""
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
-    def block(self, i: int) -> list[int]:
-        """返回第 i 个逻辑块的 token_ids，用于前缀缓存哈希计算。"""
-        assert 0 <= i < self.num_blocks
-        return self.token_ids[i * self.block_size: (i + 1) * self.block_size]
-
     def append_token(self, token_id: int):
         """decode 步完成后追加新生成的 token。"""
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
-
-    def __getstate__(self):
-        """
-        自定义 pickle 序列化（进程间通信优化）：
-          prefill 时序列化完整 token_ids；decode 时只序列化 last_token。
-        """
-        last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-                self.num_scheduled_tokens, self.block_table, last_state)
-
-    def __setstate__(self, state):
-        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-         self.num_scheduled_tokens, self.block_table, last_state) = state
-        if isinstance(last_state, list):
-            self.token_ids = last_state
-            self.last_token = self.token_ids[-1]
-        else:
-            self.token_ids = []
-            self.last_token = last_state

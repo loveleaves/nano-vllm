@@ -3,11 +3,6 @@ from torch import nn
 import torch.nn.functional as F
 
 
-def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-    """默认权重加载：直接 copy。"""
-    param.data.copy_(loaded_weight)
-
-
 class LinearBase(nn.Module):
     """
     线性层基类，提供统一的权重初始化和 weight_loader 注册接口。

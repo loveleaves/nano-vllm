@@ -176,21 +176,9 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
     def _build_model(self, hf_config):
-        """构建模型，并将所有 Attention 层替换为 AttentionWithKVCache。"""
-        from nanovllm.models.qwen3 import (
-            Qwen3ForCausalLM, Qwen3Attention as _Qwen3Attention,
-        )
-        model = Qwen3ForCausalLM(hf_config)
-        # 替换所有 Attention 层为 AttentionWithKVCache
-        # 已经用monkey mock，这里不需要了
-        # for module in model.modules():
-        #     if isinstance(module, _Qwen3Attention):
-        #         old_attn = module.attn
-        #         module.attn = AttentionWithKVCache(
-        #             old_attn.num_heads, old_attn.head_dim,
-        #             old_attn.scale, old_attn.num_kv_heads,
-        #         )
-        return model
+        """构建模型。Attention 层已在模块级 monkey-patch 为 AttentionWithKVCache。"""
+        from nanovllm.models.qwen3 import Qwen3ForCausalLM
+        return Qwen3ForCausalLM(hf_config)
 
     def warmup_model(self):
         """

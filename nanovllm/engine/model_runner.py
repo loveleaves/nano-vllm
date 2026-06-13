@@ -52,9 +52,26 @@ class AttentionWithKVCache(nn.Module):
             self.v_cache[block_id, offset] = v[idx]
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        shape 记号约定：
+          N   — prefill 时拉平拼接的全部 token 数（= Σ 各序列 q 长度）
+          Ls  — 单条序列的 token 数（prefill 逐序列循环内）
+          bs  — decode 时的序列数（每序列仅 1 个 query token）
+          H   — query 头数 self.num_heads
+          Hkv — KV 头数 self.num_kv_heads（GQA 下 Hkv < H）
+          G   — GQA 组数 self.num_kv_groups = H // Hkv
+          D   — head_dim
+          S   — block_size（每个物理块的 token 容量）
+
+        入参（已是「头维展开」后的 3D 张量）：
+          q: [N, H,   D]   k/v: [N, Hkv, D]   （decode 时首维为 bs）
+        返回：
+          o: [N, H, D]     （decode 时 [bs, H, D]）
+        SDPA 要求 4D 布局 [batch, heads, seq, D]，故下面频繁 transpose/unsqueeze。
+        """
         context = get_context()
 
-        # 写入 KV cache
+        # 写入 KV cache：把本步算出的 k/v 按 slot_mapping scatter 到分页 cache
         if context.slot_mapping is not None and self.k_cache.numel() > 0:
             self._store_kv(k, v, context.slot_mapping)
 
@@ -62,60 +79,61 @@ class AttentionWithKVCache(nn.Module):
             # 按序列边界逐条计算注意力，避免不同序列间的跨序列 attend 污染。
             # is_causal=True 的下三角 mask 作用于拼接后的全局 token 序列，
             # 若多条序列拼在一起，后序序列会 attend 到前序序列，导致 KV cache 污染。
-            cu_q = context.cu_seqlens_q  # [num_seqs+1]
+            cu_q = context.cu_seqlens_q  # [num_seqs+1]，前缀和，相邻差即各序列 q 长度
             if cu_q is None:
-                # 单序列 fallback（无 context 信息时）
+                # 单序列 fallback（无 context 信息时）：整个 N 当一条序列处理
                 if self.num_kv_groups > 1:
-                    k = k.repeat_interleave(self.num_kv_groups, dim=1)
-                    v = v.repeat_interleave(self.num_kv_groups, dim=1)
+                    # GQA：把 Hkv 个 KV 头各复制 G 份，对齐到 H 个 query 头
+                    k = k.repeat_interleave(self.num_kv_groups, dim=1)  # [N, Hkv, D] → [N, H, D]
+                    v = v.repeat_interleave(self.num_kv_groups, dim=1)  # [N, Hkv, D] → [N, H, D]
+                # [N, H, D] → transpose → [H, N, D] → unsqueeze(0) → [1, H, N, D]
                 q = q.transpose(0, 1).unsqueeze(0)
                 k = k.transpose(0, 1).unsqueeze(0)
                 v = v.transpose(0, 1).unsqueeze(0)
-                o = F.scaled_dot_product_attention(q, k, v, scale=self.scale, is_causal=True)
-                return o.squeeze(0).transpose(0, 1)
+                o = F.scaled_dot_product_attention(q, k, v, scale=self.scale, is_causal=True)  # [1, H, N, D]
+                return o.squeeze(0).transpose(0, 1)  # [1,H,N,D] → [H,N,D] → [N, H, D]
             out_parts = []
             for s in range(cu_q.shape[0] - 1):
-                s0, s1 = cu_q[s].item(), cu_q[s + 1].item()
-                q_s = q[s0:s1]
-                k_s = k[s0:s1]
-                v_s = v[s0:s1]
+                s0, s1 = cu_q[s].item(), cu_q[s + 1].item()  # 第 s 条序列在拼接维上的 [s0, s1)
+                q_s = q[s0:s1]                # [Ls, H,   D]
+                k_s = k[s0:s1]                # [Ls, Hkv, D]
+                v_s = v[s0:s1]                # [Ls, Hkv, D]
                 if self.num_kv_groups > 1:
-                    k_s = k_s.repeat_interleave(self.num_kv_groups, dim=1)
-                    v_s = v_s.repeat_interleave(self.num_kv_groups, dim=1)
-                q_t = q_s.transpose(0, 1).unsqueeze(0)
-                k_t = k_s.transpose(0, 1).unsqueeze(0)
-                v_t = v_s.transpose(0, 1).unsqueeze(0)
-                o_s = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale, is_causal=True)
-                out_parts.append(o_s.squeeze(0).transpose(0, 1))
-            return torch.cat(out_parts, dim=0)
+                    k_s = k_s.repeat_interleave(self.num_kv_groups, dim=1)  # → [Ls, H, D]
+                    v_s = v_s.repeat_interleave(self.num_kv_groups, dim=1)  # → [Ls, H, D]
+                q_t = q_s.transpose(0, 1).unsqueeze(0)  # [Ls,H,D] → [1, H, Ls, D]
+                k_t = k_s.transpose(0, 1).unsqueeze(0)  # [1, H, Ls, D]
+                v_t = v_s.transpose(0, 1).unsqueeze(0)  # [1, H, Ls, D]
+                o_s = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale, is_causal=True)  # [1, H, Ls, D]
+                out_parts.append(o_s.squeeze(0).transpose(0, 1))  # → [Ls, H, D]
+            return torch.cat(out_parts, dim=0)  # 拼回 [N, H, D]
         else:
-            # decode: 从 KV cache 读历史 k/v
-            bs = q.size(0)
-            block_tables = context.block_tables    # [bs, max_blocks]
-            context_lens = context.context_lens    # [bs]
+            # decode: 每序列只有 1 个 query token，K/V 从分页 cache 读全部历史
+            bs = q.size(0)                          # q: [bs, H, D]
+            block_tables = context.block_tables     # [bs, max_blocks]，物理块号，-1 为 padding
+            context_lens = context.context_lens     # [bs]，各序列历史 KV 长度（含当前 token）
             outputs = []
             for i in range(bs):
-                seq_len = context_lens[i].item()
+                seq_len = context_lens[i].item()    # 标量 Ls_i
+                # 该序列历史占用的块数（向上取整）；k_cache.shape[1] 即 S
                 num_blocks_needed = (seq_len + self.k_cache.shape[1] - 1) // self.k_cache.shape[1]
-                blocks = block_tables[i, :num_blocks_needed]
-                # 收集历史 k/v：[seq_len, num_kv_heads, head_dim]
+                blocks = block_tables[i, :num_blocks_needed]   # [num_blocks_needed]
+                # 逐块取出再拼接：每块 k_cache[b] 形如 [S, Hkv, D]，
+                # cat 后 [num_blocks_needed*S, Hkv, D]，截到 [:seq_len] → [Ls_i, Hkv, D]
                 k_hist = torch.cat([self.k_cache[b] for b in blocks], dim=0)[:seq_len]
                 v_hist = torch.cat([self.v_cache[b] for b in blocks], dim=0)[:seq_len]
-                # GQA 扩展
                 if self.num_kv_groups > 1:
-                    k_hist = k_hist.repeat_interleave(self.num_kv_groups, dim=1)
-                    v_hist = v_hist.repeat_interleave(self.num_kv_groups, dim=1)
-                # q[i]: [num_heads, head_dim]
-                qi = q[i].unsqueeze(1)                  # [num_heads, 1, head_dim]
-                # k_hist: [seq_len, num_heads, head_dim] → [num_heads, seq_len, head_dim]
-                ki = k_hist.transpose(0, 1)
-                vi = v_hist.transpose(0, 1)
-                # scaled dot product: [num_heads, 1, head_dim]
+                    k_hist = k_hist.repeat_interleave(self.num_kv_groups, dim=1)  # [Ls_i, Hkv, D] → [Ls_i, H, D]
+                    v_hist = v_hist.repeat_interleave(self.num_kv_groups, dim=1)  # [Ls_i, Hkv, D] → [Ls_i, H, D]
+                qi = q[i].unsqueeze(1)                  # q[i]:[H, D] → [H, 1, D]（1 个 query token）
+                ki = k_hist.transpose(0, 1)             # [Ls_i, H, D] → [H, Ls_i, D]
+                vi = v_hist.transpose(0, 1)             # [H, Ls_i, D]
+                # SDPA：输入补 batch 维 → q[1,H,1,D] / k,v[1,H,Ls_i,D]，无 causal（单 token attend 全历史）
                 oi = F.scaled_dot_product_attention(
                     qi.unsqueeze(0), ki.unsqueeze(0), vi.unsqueeze(0), scale=self.scale
-                ).squeeze(0)                            # [num_heads, 1, head_dim]
-                outputs.append(oi.squeeze(1))           # [num_heads, head_dim]
-            return torch.stack(outputs, dim=0)          # [bs, num_heads, head_dim]
+                ).squeeze(0)                            # [1,H,1,D] → [H, 1, D]
+                outputs.append(oi.squeeze(1))           # [H, 1, D] → [H, D]
+            return torch.stack(outputs, dim=0)          # 堆叠 → [bs, H, D]
 
 
 # 运行时 patch：将 Qwen3Attention 中的 self.attn 替换为 AttentionWithKVCache

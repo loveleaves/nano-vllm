@@ -224,13 +224,26 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        """
+        构造 prefill 一步的模型输入与全局 Context。
+
+        多条序列的 token 被「拉平拼接」成一维张量（varlen 布局，无 padding），
+        序列边界靠 cu_seqlens 前缀和切分。每个 token 还需算出它在全局 KV cache
+        里的写入 slot（slot_mapping），forward 时 Attention 据此 scatter 写入。
+
+        关键量：
+          start / end — 本步要处理的 token 在 seq 中的 [start, end) 区间。
+                        阶段一 num_cached_tokens 恒为 0，故 start=0、end=整段 prompt。
+          seqlen_q    — query 长度（本步新算的 token 数）
+          seqlen_k    — key 长度（= end，含此前已缓存部分；阶段一与 seqlen_q 相等）
+        """
         input_ids_list = []
         positions_list = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
+        cu_seqlens_q = [0]   # query 累计长度前缀和，[num_seqs+1]，相邻差即各 seq 的 q 长度
+        cu_seqlens_k = [0]   # key 累计长度前缀和，供变长注意力切分每条序列的 KV 范围
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
+        slot_mapping = []    # 每个 query token 写入 KV cache 的绝对槽位（block_id*block_size+offset）
 
         for seq in seqs:
             start = seq.num_cached_tokens
@@ -238,6 +251,7 @@ class ModelRunner:
             end = start + seqlen_q
             seqlen_k = end
 
+            # 拉平拼接：input_ids/positions 直接 extend，无 padding；位置从 start 开始连续递增
             input_ids_list.extend(seq[start:end])
             positions_list.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -245,21 +259,29 @@ class ModelRunner:
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
 
+            # warmup 阶段 KV cache 尚未分配、seq 无 block_table：用 -1 占位，
+            # Attention._store_kv 见 -1 / 空 cache 会跳过写入。
             if not seq.block_table:
                 slot_mapping.extend([-1] * seqlen_q)
                 continue
+            # 把逻辑区间 [start, end) 映射到物理 slot。token 可能横跨多个物理块，
+            # 故逐块计算该块覆盖的 slot 子区间再拼接。
             start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size   # 向上取整，开区间右端
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
+                    # 首块可能从块中间开始（start 未对齐块边界）
                     slot_start += start % self.block_size
                 if i != end_block - 1:
+                    # 中间块：整块写满
                     slot_end = seq.block_table[i] * self.block_size + self.block_size
                 else:
+                    # 末块：只写到 end，end - i*block_size 为末块内已用 token 数
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
 
+        # pin_memory + non_blocking：锁页内存上异步 H2D 拷贝，与后续 CPU 工作重叠
         input_ids = torch.tensor(input_ids_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -269,15 +291,28 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        """
+        构造 decode 一步的模型输入与全局 Context。
+
+        decode 每条序列只输入「最后一个 token」（上一步刚生成的），算它的 KV 并写入
+        cache，再对全部历史 KV 做注意力。因此 query 长度恒为 1，batch 维即序列数。
+
+        与 prefill 的关键差异：
+          - 输入是 1 个 token（seq.last_token），不是整段区间
+          - 不传 cu_seqlens；改传 context_lens（各序列 KV 总长）+ block_tables，
+            供 Attention 从分页 cache 里按块取回历史 K/V
+        """
         input_ids_list = []
         positions_list = []
         slot_mapping = []
         context_lens = []
 
         for seq in seqs:
-            input_ids_list.append(seq.last_token)
-            positions_list.append(len(seq) - 1)
-            context_lens.append(len(seq))
+            input_ids_list.append(seq.last_token)        # 仅输入最后一个 token
+            positions_list.append(len(seq) - 1)          # 其位置 = 序列当前长度 - 1（0-based）
+            context_lens.append(len(seq))                # 历史 KV 长度，含本 token
+            # 本 token 写入末块内偏移 last_block_num_tokens-1 处；
+            # may_append 已在调度时确保末块容得下它（len%block_size==1 时新开块）。
             slot_mapping.append(
                 seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             )
@@ -286,6 +321,8 @@ class ModelRunner:
         positions = torch.tensor(positions_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         sm = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cl = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # block_tables 是规整二维张量 [num_seqs, max_blocks]，短序列用 -1 右侧补齐对齐，
+        # Attention 按 context_lens 只取前若干块，padding 的 -1 不会被读到。
         max_len = max(len(seq.block_table) for seq in seqs)
         bt = [[*seq.block_table, *[-1] * (max_len - len(seq.block_table))] for seq in seqs]
         bt = torch.tensor(bt, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)

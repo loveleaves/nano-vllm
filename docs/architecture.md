@@ -127,6 +127,10 @@ prefill → flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)
 decode  → flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache, cache_seqlens, block_table, ...)
 ```
 
+flash-attn / Triton 为可选依赖（pyproject `[gpu]` extras）：不可用或张量在 CPU 上时
+prefill/decode 退回 SDPA（按 cu_seqlens 逐序列计算，支持前缀缓存读取）、KV 写入退回
+朴素 Python scatter，使单元测试可在 CPU 上运行（fallback 性能限制见 detailed_design.md §7.6）。
+
 ### 3.5 张量并行（TP）
 
 权重切分方式：
@@ -140,9 +144,10 @@ decode  → flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache, cache_seql
 
 ### 3.6 CUDA Graph
 
-- decode 阶段录制 graph_bs = [1,2,4,8,16,...,512]
-- 各 graph 共享同一内存池（graph_pool）
-- replay 时修改静态张量（input_ids, positions, slot_mapping 等），不重新分配内存
+- decode 阶段录制 graph_bs = [1, 2, 4, 8] + [16, 32, 48, ..., 512]（16 起步长 16，上限 min(max_num_seqs, 512)）
+- 各 graph 共享同一内存池（graph_pool），从大到小录制（第一个 graph 创建 pool）
+- replay 前将本步数据写入静态张量（input_ids, positions, slot_mapping 等），不重新分配内存
+- 实际 bs 向上取整到最近的 graph_bs，padding 行 slot_mapping=-1 / context_lens=0，输出丢弃
 
 ---
 
@@ -202,8 +207,7 @@ nanovllm/
 │   ├── layernorm.py           # RMSNorm + Fused Add-RMSNorm
 │   ├── linear.py              # TP linear 层族
 │   ├── rotary_embedding.py    # RoPE + lru_cache
-│   ├── sampler.py             # Gumbel-max 采样
-│   └── triton_kernels.py      # Triton KV 写入 kernel
+│   └── sampler.py             # Gumbel-max 采样
 ├── models/
 │   └── qwen3.py               # Qwen3ForCausalLM 完整模型
 └── utils/

@@ -411,12 +411,32 @@ sampler(logits, temperatures) → token_ids
 
 ## 7. Phase 4：工程优化
 
+> Phase 4 不再增加新模型能力，而是围绕"在固定显存下榨干吞吐与延迟"做工程优化。
+> 五项优化分属三个维度：**省显存/省算力**（前缀缓存复用已算过的 KV）、**提利用率**
+> （Chunked Prefill 让长 prompt 与 decode 共享 batch 预算）、**扩规模 + 降开销**
+> （张量并行跨卡切权重、CUDA Graph 消除 Python 启动开销、FlashAttention/Triton
+> 加速核心算子）。下面每小节先讲"为什么这样设计"的算法原理，再对应到代码实现。
+
 ### 7.1 前缀缓存（Prefix Caching）
+
+**要解决的问题**：多个请求常共享相同前缀（同一段 system prompt、few-shot 示例、
+多轮对话历史）。朴素实现会对每个请求把整段前缀重新做一遍 prefill，重复计算且重复
+占用 KV cache。前缀缓存的核心思想是：**KV cache 中某个 block 的内容，完全由"它存的
+这批 token"以及"它前面所有 token"决定**——只要前缀逐 token 完全一致，对应 block 的
+K/V 就一定相同，可直接复用，跳过重算。
 
 **算法**：链式 xxhash
 ```python
 hash(block_i) = xxhash(tokens_in_block_i + prev_block_hash)
 ```
+
+**为什么要"链式"**：若只对块内 token 做哈希，`[A,B]` 这个块无论它前面是
+`[X,Y]` 还是 `[P,Q]` 都得到同一哈希，而二者的 K/V 因注意力依赖前文其实不同，复用
+会出错。把前一块的哈希拼进来（`compute_hash` 的 `prefix` 参数，`block_manager.py:65`），
+就让哈希编码了"从序列开头到本块的完整前缀"，等价于给每条前缀链一个唯一指纹。首块
+`prefix = -1` 作为链起点。xxhash 是非加密哈希，速度极快，适合每步推理高频调用；为防
+哈希碰撞，命中后还会比对完整 `token_ids`（`can_allocate` 的 `block.token_ids != token_ids`
+校验，`block_manager.py:114`）。
 
 **命中检测**（`can_allocate`）：
 - 遍历除最后块外的满块，计算链式哈希
@@ -428,20 +448,63 @@ hash(block_i) = xxhash(tokens_in_block_i + prev_block_hash)
 - 释放时不立即删除哈希，延迟到物理块被复用时清理
 - `_allocate_block` 复用已有哈希块时，主动删除旧哈希避免脏命中
 
+**为什么只哈希"满块"**：哈希的语义是"这个 block 的内容已确定、可被复用"。未填满的
+块还会继续写入 token，内容尚未定型，此刻注册哈希会导致后续命中读到半成品。因此
+`can_allocate` 遍历时跳过最后一块（`range(seq.num_blocks - 1)`），`hash_blocks` 也只
+覆盖已满的块。block_size 越大复用粒度越粗（命中率受前缀对齐影响），越小则元数据开销越大。
+
 **哈希注册时机（`hash_blocks`）**：
 - `Scheduler.postprocess` 在每步推理后调用，对 `[num_cached_tokens,
   num_cached_tokens + num_scheduled_tokens)` 范围内**新填满**的块计算并注册哈希
 - 链式起点取前一块已记录的 `hash`（首块为 -1）；末尾未满块跳过，等填满后再注册
 - 因此 prefill 各 chunk、decode 跨块边界时都会增量注册，无需一次性扫描
 
+**延迟删除的意义**：释放（`deallocate`）时块归还 FIFO 空闲队列**末尾**且保留 `hash`，
+直到该物理块被真正复用（`_allocate_block`）才从哈希表删除。这样"刚跑完的请求"的前缀
+块会尽可能久地停留在缓存里，下一个相似请求仍能命中——FIFO 末尾入队 + 延迟删除共同
+实现了一种近似 LRU 的缓存保活策略。
+
 ### 7.2 Chunked Prefill
+
+**要解决的问题**：prefill 的计算量随 prompt 长度线性增长，一条几千 token 的长 prompt
+若一次性算完，会独占整个 batch、把同批 decode 请求的延迟拖高（decode 每步只算 1 token，
+本该很快）。同时 GPU 一次能处理的 token 数有上限（`max_num_batched_tokens` 预算）。
+Chunked Prefill 的思想是：**把长 prompt 的 prefill 切成多个 chunk，分摊到连续若干步**，
+每步只消耗预算内的 token，使长 prompt 不再"霸占"算力。
 
 **策略**：
 - 只允许 waiting 队列的第一个 seq 分块（避免其他 seq 饥饿）
 - `num_scheduled_tokens = min(num_remaining_tokens, budget_remaining)`
 - 分块中途不追加新 token（`postprocess` 中通过 `num_cached_tokens < num_tokens` 判断）
 
+**为什么只让第一个 seq 分块**：若任意 seq 都能被切，预算可能被多个半截 prompt 瓜分，
+谁都凑不满完整 prompt，请求迟迟无法进入 decode（饥饿）。规则是：只有当 `scheduled_seqs`
+还为空（即本步第一个被调度的 seq）时才允许 `remaining < num_tokens` 继续分块
+（`scheduler.py:77`）；后续 seq 必须能被完整 prefill 才加入，否则留待下一步。
+
+**"分块中途不产 token"如何实现**：模型对一个 chunk 也会输出 logits，但只有 prompt 的
+最后一个 token 的输出才是真正要采样的"下一个 token"。`postprocess` 用
+`is_prefill and seq.num_cached_tokens < seq.num_tokens` 判断当前是否仍在 prompt 中间
+（`scheduler.py:142`），是则 `continue` 丢弃本步采样结果，只推进 `num_cached_tokens`，
+直到最后一个 chunk 才真正 `append_token`。前缀缓存与之天然协作：`num_cached_tokens`
+既记录已缓存命中的前缀，也记录已 prefill 的 chunk 进度，二者用同一字段串起。
+
 ### 7.3 张量并行（Tensor Parallelism）
+
+**要解决的问题**：单卡放不下大模型的权重，或单卡算力不足。张量并行把**单个算子的
+权重矩阵切分到多张卡**，每卡只算一部分，再用集合通信把结果拼回，从而把显存和算力
+横向扩展到 N 张卡。它与"流水线并行（按层切）"正交，针对的是单层内部的矩阵乘法。
+
+**核心代数原理**：一个 MLP `Y = (X·A)·B`（A 升维、B 降维）可按下面方式切分而结果不变：
+- **A 按列切**（ColumnParallel）：`A = [A₁ | A₂]`，则 `X·A = [X·A₁ | X·A₂]`，每卡
+  独立算出输出的一段列，**无需通信**。输出天然是"按列分片"的。
+- **B 按行切**（RowParallel）：上一步的分片输出 `[Y₁ | Y₂]` 正好对齐 B 的行切分
+  `B = [B₁; B₂]`，于是 `Y·B = Y₁·B₁ + Y₂·B₂`——每卡算一个部分和，再用
+  **一次 all_reduce 求和**得到完整结果。
+
+把"列切→行切"配对（Attention 的 QKV 用列切、O 投影用行切；MLP 的 gate/up 用列切、
+down 用行切），整个 block 内只需在末尾做**一次 all_reduce**，通信量最小。GQA 下要求
+`num_kv_heads % tp_size == 0`，因为 KV 头必须整除地分到各卡（见 7.6 限制）。
 
 **进程通信**：
 ```
@@ -451,11 +514,35 @@ rank 0（主进程）─── NCCL all_reduce ───→ rank 1..N
         └──── Event.set() ──→ Event.wait()
 ```
 
-**权重分片**（TP=N 时）：
-- ColumnParallel: `weight[out/N*rank : out/N*(rank+1), :]`
-- RowParallel: `weight[:, in/N*rank : in/N*(rank+1)]`
+这里有两套通信，职责不同：
+- **NCCL all_reduce**：GPU 间的张量级同步（上面的部分和求和），走显卡高速互联，在
+  RowParallel.forward 内触发，对模型代码透明。
+- **SharedMemory + Event**：CPU 侧的"控制面"。rank 0 是主进程，负责调度并把
+  `(method_name, args)` 用 pickle 写入共享内存、`Event.set()` 唤醒各 worker；rank>0
+  阻塞在 `loop()→read_shm()` 等待指令（`model_runner.py:88-101`）。这样多卡执行同一
+  份指令流，避免每个 rank 各自重复跑调度逻辑导致不一致。
+
+**权重分片**（TP=N 时，由各 Linear 层的 `weight_loader` 在加载时自动切片）：
+- ColumnParallel: `weight[out/N*rank : out/N*(rank+1), :]` —— 取本 rank 负责的输出行段
+- RowParallel: `weight[:, in/N*rank : in/N*(rank+1)]` —— 取本 rank 负责的输入列段
+
+每个 rank 只把属于自己的那一片权重 load 进显存（`linear.py` 的
+`loaded_weight.narrow(tp_dim, start_idx, shard_size)`），因此显存占用降到约 1/N，而非
+先加载完整权重再切。
 
 ### 7.4 CUDA Graph
+
+**要解决的问题**：decode 每步只算 1 个 token，GPU 上的实际计算极短，但每步要从 Python
+逐个 launch 几百个 CUDA kernel（每层的 norm、QKV、attention、MLP……）。这些 launch 的
+**CPU 开销和 kernel 启动延迟**会成为瓶颈——GPU 经常在"等 CPU 发下一个 kernel"。CUDA
+Graph 的思想是：**把一整串 kernel 的调用序列录制成一张静态图，之后用一次 `replay()`
+重放整张图**，把成百上千次 launch 压缩成一次提交，消除 Python 与 launch 开销。
+
+**为什么只能用于 decode、且要按 batch size 分桶**：CUDA Graph 录制的是**固定的内存
+地址和固定的张量形状**。prefill 每步 token 数都不同（形状多变），无法复用同一张图；
+decode 每步恰好每序列 1 token，形状只随 batch size 变化。于是为一组离散的 batch size
+各录一张图（`graph_bs = [1,2,4,8,16,32,...,512]`），运行时把实际 bs **向上取整**到最近
+的桶，多出来的行用 padding 填充并丢弃其输出。
 
 **录制策略**：
 - batch sizes = [1, 2, 4, 8] + [16, 32, 48, ..., 512]（16 起步长 16，上限 min(max_num_seqs, 512)）
@@ -473,13 +560,27 @@ rank 0（主进程）─── NCCL all_reduce ───→ rank 1..N
 
 ### 7.5 FlashAttention 与 Triton
 
+**FlashAttention 的原理**：朴素注意力会显式构造 `S = QKᵀ`（形状 `[seqlen, seqlen]`）的
+完整分数矩阵再 softmax，显存和带宽随序列长度平方增长，且要反复读写这块大中间张量。
+FlashAttention 用**分块（tiling）+ online softmax** 把 attention 融合成一个 kernel：按
+块遍历 K/V，边算边用"在线更新最大值与归一化因子"的方式累加输出，**从不实例化完整的
+`S` 矩阵**。结果是显存从 O(n²) 降到 O(n)、HBM 访存大幅减少，长序列下显著更快。
+
 **Prefill**：`flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)`
-- 输入为打平的变长序列，自动处理多 seq batch
+- 输入为打平的变长序列，用 `cu_seqlens`（前缀和形式的序列边界）标记每条序列的起止，
+  kernel 据此在序列内部做 causal attention 而不跨序列，**无需 padding 到等长**，省去
+  传统 batch 的填充浪费。
+- 有前缀缓存命中时（`block_tables is not None`），K/V 从分页 cache 读历史前缀
+  （`attention.py:136-150`），`cu_seqlens_k > cu_seqlens_q` 表示 key 比 query 多出已缓存
+  的前缀部分。
 
 **Decode**：`flash_attn_with_kvcache(q, k_cache, v_cache, block_table=..., cache_seqlens=...)`
-- 直接以分页 KV cache 作为输入，避免 gather
+- 直接以分页 KV cache 作为输入，按 `block_table` 寻址、`cache_seqlens` 标记每序列已
+  缓存长度，kernel 内部直接索引物理块，**避免先把分散的块 gather 成连续张量**再计算。
 
-**Triton KV 写入**：
+**Triton KV 写入**：把当前步算出的 K/V 散落写入分页 cache 的指定 slot。`slot_mapping`
+预先把"第 i 个 token → 哪个物理槽位"算好，kernel 每个 program 处理一个 token、向量化
+搬运 `D = num_kv_heads * head_dim` 个元素，`slot == -1` 跳过（CUDA graph 的 padding 行）。
 ```python
 @triton.jit
 def store_kvcache_kernel(key_ptr, key_stride, value_ptr, value_stride,

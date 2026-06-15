@@ -90,7 +90,8 @@ Qwen3ForCausalLM         模型层:RMSNorm / Attention(Flash+Triton)/ SwiGLU / T
 ```
 
 详细设计见 [docs/architecture.md](docs/architecture.md)(架构与关键设计决策)和
-[docs/detailed_design.md](docs/detailed_design.md)(逐模块实现细节与已知限制)。
+[docs/detailed_design.md](docs/detailed_design.md)(逐模块实现细节与已知限制);
+各工程优化专题的 nano-vllm vs vLLM 对比调研报告与完整文档索引见 [docs/README.md](docs/README.md)。
 
 ## 实现阶段
 
@@ -109,8 +110,7 @@ Qwen3ForCausalLM         模型层:RMSNorm / Attention(Flash+Triton)/ SwiGLU / T
 | 分支 | 作用 |
 |------|------|
 | `main` | 上游 [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 原版代码,仅用于跟踪与对照,不在其上开发 |
-| `test` | 基于 `main` 的源码阅读笔记(docs/01–07、dispatch、op_adapt 等),学习上游实现时的工作分支 |
-| `my_nano` | **自研实现的集成主分支**:从架构设计文档起步,Phase 1–4 经 PR #1–#4 依次并入 |
+| `my_nano` | **自研实现的集成主分支**:从架构设计文档起步,Phase 1–4 经 PR #1–#4 依次并入,源码阅读笔记(docs/01–07、dispatch、op_adapt 等) |
 | `phase1` | Phase 1 功能分支:Config / Sequence / BlockManager / Scheduler(已并入 `my_nano`) |
 | `phase2` | Phase 2 功能分支:RMSNorm / RoPE / Attention / Linear / Sampler / Qwen3 模型(已并入) |
 | `phase3` | Phase 3 功能分支:权重加载 + 单进程推理(已并入);并入后追加了 prefill 跨序列注意力修复 `25b07bd` |

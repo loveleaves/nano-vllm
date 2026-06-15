@@ -217,6 +217,7 @@ class Attention(nn.Module):
                 block_size = k_cache.shape[1]
                 num_blocks = (seqlen_k + block_size - 1) // block_size
                 blocks = context.block_tables[s, :num_blocks]
+                # 把分散的 KV blocks 拼回完整 prefix KV sequence，然后截断到真实长度
                 k_s = torch.cat([k_cache[b] for b in blocks], dim=0)[:seqlen_k]
                 v_s = torch.cat([v_cache[b] for b in blocks], dim=0)[:seqlen_k]
             else:
@@ -228,6 +229,21 @@ class Attention(nn.Module):
             k_t = k_s.transpose(0, 1).unsqueeze(0)
             v_t = v_s.transpose(0, 1).unsqueeze(0)
             if seqlen_k > seqlen_q:
+                """
+                prefix cache 场景（KV 更长）,mask 要做：
+                    - 允许 Q attend 到完整 K（包括历史 prefix + 当前）
+                    但要保证：
+                    - causal consistency(is_causal=True意味着Q_len == K_len)
+                    - 不能看到未来 token
+                比如：seqlen_q=4，seqlen_k=8，
+                    mask = “前 4 列全可见 + 后 4 列 causal 对齐”的 attention mask
+                [
+                    [1, 1, 1, 1, 1, 0, 0, 0],
+                    [1, 1, 1, 1, 1, 1, 0, 0],
+                    [1, 1, 1, 1, 1, 1, 1, 0],
+                    [1, 1, 1, 1, 1, 1, 1, 1]
+                ]
+                """
                 mask = torch.ones(seqlen_q, seqlen_k, dtype=torch.bool,
                                   device=q.device).tril(seqlen_k - seqlen_q)
                 o_s = F.scaled_dot_product_attention(

@@ -158,6 +158,14 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]) -> torch.Tensor:
+        """
+        将“logical token → physical KV block”的映射表记录到context中，
+        attention层查找kv cache table找到所有kv
+        FlashAttention kernel 要求：
+            - batch 内所有 sequence 的 block_table shape 必须一致
+            - 所以必须用-1 padding
+        使用自定义SPDA可以不用padding
+        """
         max_len = max(len(seq.block_table) for seq in seqs)
         bt = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         return torch.tensor(bt, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)

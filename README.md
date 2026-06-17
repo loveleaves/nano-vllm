@@ -91,7 +91,9 @@ Qwen3ForCausalLM         模型层:RMSNorm / Attention(Flash+Triton)/ SwiGLU / T
 
 详细设计见 [docs/architecture.md](docs/architecture.md)(架构与关键设计决策)和
 [docs/detailed_design.md](docs/detailed_design.md)(逐模块实现细节与已知限制);
-各工程优化专题的 nano-vllm vs vLLM 对比调研报告与完整文档索引见 [docs/README.md](docs/README.md)。
+各工程优化专题的 nano-vllm vs vLLM 对比调研报告与完整文档索引见 [docs/README.md](docs/README.md);
+新模型架构(Qwen3.5 dense / MoE 混合架构)的适配设计、调研与测试见
+[docs/model_adaptation/](docs/model_adaptation/README.md)。
 
 ## 实现阶段
 

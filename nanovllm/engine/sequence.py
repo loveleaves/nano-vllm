@@ -34,10 +34,12 @@ class Sequence:
     block_size: int = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params: SamplingParams = None):
+    def __init__(self, token_ids: list[int], sampling_params: SamplingParams = None,
+                 priority: int = 0):
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.seq_id = next(Sequence.counter)
+        self.priority = priority   # 调度优先级（值越小越先；PriorityRequestQueue 用）
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]

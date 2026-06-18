@@ -33,6 +33,7 @@ class EngineCoreRequest:
     request_id: str
     prompt_token_ids: list[int]
     sampling_params: SamplingParams
+    priority: int = 0   # 调度优先级（值越小越先；仅 priority 策略生效）
 
 
 @dataclass

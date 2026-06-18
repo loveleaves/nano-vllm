@@ -24,11 +24,12 @@ class Processor:
         prompt: str | list[int],
         sampling_params: SamplingParams,
         request_id: str | None = None,
+        priority: int = 0,
     ) -> EngineCoreRequest:
         """规范化单条输入为 EngineCoreRequest。
 
         prompt 为 str 时用 tokenizer 编码；为 list[int] 时视作已 tokenize 的 id。
-        request_id 缺省时自增分配（保证唯一）。
+        request_id 缺省时自增分配（保证唯一）。priority 仅在 priority 调度策略下生效。
         """
         if request_id is None:
             request_id = str(next(self._counter))
@@ -41,4 +42,5 @@ class Processor:
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
+            priority=priority,
         )

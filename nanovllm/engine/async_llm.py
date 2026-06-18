@@ -87,8 +87,9 @@ class AsyncLLM:
     # ── 对外接口 ──────────────────────────────────────────────────────────────
     async def add_request(self, prompt: str | list[int],
                           sampling_params: SamplingParams,
-                          request_id: str | None = None) -> RequestOutputCollector:
-        req = self.processor.process_inputs(prompt, sampling_params, request_id)
+                          request_id: str | None = None,
+                          priority: int = 0) -> RequestOutputCollector:
+        req = self.processor.process_inputs(prompt, sampling_params, request_id, priority)
         collector = RequestOutputCollector()
         self.collectors[req.request_id] = collector
         self.output_processor.add_request(req)

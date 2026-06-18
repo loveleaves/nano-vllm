@@ -40,9 +40,9 @@ class LLMEngine:
         self.engine_core.exit()
 
     def add_request(self, prompt: str | list[int],
-                    sampling_params: SamplingParams) -> str:
+                    sampling_params: SamplingParams, priority: int = 0) -> str:
         """登记一条请求，返回其 request_id。"""
-        req = self.processor.process_inputs(prompt, sampling_params)
+        req = self.processor.process_inputs(prompt, sampling_params, priority=priority)
         self.engine_core.add_request(req)
         self.output_processor.add_request(req)
         return req.request_id

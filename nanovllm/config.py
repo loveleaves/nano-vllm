@@ -17,6 +17,7 @@ class Config:
       enforce_eager          — 禁用 CUDA graph（调试用）
       kvcache_block_size     — 每个 KV cache 物理块包含的 token 数（256 的倍数）
       num_kvcache_blocks     — KV cache 物理块总数（运行时由 ModelRunner 填入）
+      scheduling_policy      — waiting 队列排队策略："fcfs" 或 "priority"
       hf_config              — transformers AutoConfig 对象（运行时加载）
       eos                    — EOS token id（由 LLMEngine 从 tokenizer 填入）
     """
@@ -29,12 +30,14 @@ class Config:
     enforce_eager: bool = False
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    scheduling_policy: str = "fcfs"
     hf_config: object = field(default=None, repr=False)
     eos: int = -1
 
     def __post_init__(self):
         assert os.path.isdir(self.model), f"模型路径不存在: {self.model}"
         assert self.kvcache_block_size % 256 == 0, "kvcache_block_size 必须是 256 的倍数"
+        assert self.scheduling_policy in ("fcfs", "priority")
         assert 1 <= self.tensor_parallel_size <= 8
         assert 0.0 < self.gpu_memory_utilization <= 1.0
 

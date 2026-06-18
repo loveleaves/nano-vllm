@@ -20,7 +20,7 @@ from nanovllm.engine.core_types import (
     EngineCoreRequest,
     FinishReason,
 )
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.sched import Scheduler, SchedulingPolicy
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.worker import Worker
 
@@ -57,6 +57,7 @@ class EngineCore:
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
             eos=config.eos,
+            policy=SchedulingPolicy(config.scheduling_policy),
         )
         # request_id ↔ Sequence，供 abort / 结束清理
         self.requests: dict[str, Sequence] = {}
@@ -73,10 +74,11 @@ class EngineCore:
 
     # ── 请求管理 ──────────────────────────────────────────────────────────────
     def add_request(self, request: EngineCoreRequest):
-        seq = Sequence(request.prompt_token_ids, request.sampling_params)
+        seq = Sequence(request.prompt_token_ids, request.sampling_params,
+                       priority=request.priority)
         seq.request_id = request.request_id
         self.requests[request.request_id] = seq
-        self.scheduler.add(seq)
+        self.scheduler.add_request(seq)
 
     def abort_requests(self, request_ids: list[str]):
         for rid in request_ids:
@@ -90,14 +92,15 @@ class EngineCore:
     # ── 单步推理 ──────────────────────────────────────────────────────────────
     def step(self) -> EngineCoreOutputs:
         """调度一批 → 执行 → 后处理 → 收集每请求增量。"""
-        seqs, num_scheduled = self.scheduler.schedule()
-        if not seqs:
+        sched_output = self.scheduler.schedule()
+        if sched_output.is_empty:
             return EngineCoreOutputs()
 
+        seqs = sched_output.scheduled_seqs
         # 记录每个 seq 本步前已产出的 completion 数，用于判定是否真的吐了新 token
         prev_completion = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
         token_ids = self.worker.call("run", seqs)
-        self.scheduler.postprocess(seqs, token_ids, num_scheduled)
+        self.scheduler.update_from_output(sched_output, token_ids)
 
         outputs: list[EngineCoreOutput] = []
         for seq in seqs:
@@ -119,7 +122,7 @@ class EngineCore:
             ))
 
         # 吞吐提示：任一 seq 调度 >1 token 记为含 prefill，否则纯 decode
-        total = sum(num_scheduled.values())
-        is_prefill_step = any(n > 1 for n in num_scheduled.values())
-        num_tokens = total if is_prefill_step else -len(seqs)
+        is_prefill_step = any(n > 1 for n in sched_output.num_scheduled_tokens.values())
+        num_tokens = (sched_output.total_num_scheduled_tokens
+                      if is_prefill_step else -len(seqs))
         return EngineCoreOutputs(outputs=outputs, num_tokens=num_tokens)

@@ -125,6 +125,18 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    def abort(self, seq: Sequence):
+        """显式中止一个请求：从队列移除并释放其 KV 块（停止串命中 / 外部 abort）。
+
+        deallocate 对空 block_table 是安全的 no-op，故 waiting 中尚未分配的 seq 也可中止。
+        """
+        seq.status = SequenceStatus.FINISHED
+        self.block_manager.deallocate(seq)
+        if seq in self.running:
+            self.running.remove(seq)
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+
     def postprocess(self, seqs: list[Sequence], token_ids: list[int],
                     num_scheduled: dict[int, int]):
         """

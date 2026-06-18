@@ -9,16 +9,16 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.worker import Worker
 
 
 class LLMEngine:
     """
     推理引擎主入口（Phase 4：多进程 TP）。
 
-    多进程架构：
-      rank 0（主进程）：调度 + 推理 + 采样
-      rank 1..N（子进程）：ModelRunner.loop()，通过 SharedMemory+Event 等待指令
+    多进程架构（Worker/ModelRunner 分层 + ShmTransport RPC）：
+      rank 0（主进程）：调度 + Worker.call（broadcast + 本地推理 + 采样）
+      rank 1..N（子进程）：Worker.loop()，经 ShmTransport(SharedMemory+Event+msgspec) 等待指令
     """
 
     def __init__(self, model: str, **kwargs):
@@ -33,12 +33,12 @@ class LLMEngine:
 
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=Worker, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
 
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.worker = Worker(config, 0, self.events)
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -53,8 +53,8 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
+        self.worker.call("exit")
+        del self.worker
         for p in self.ps:
             p.join()
 
@@ -65,13 +65,16 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self) -> tuple[list[tuple], int]:
-        seqs, is_prefill = self.scheduler.schedule()
+        seqs, num_scheduled = self.scheduler.schedule()
         if not seqs:
             return [], 0
-        num_tokens = (sum(seq.num_scheduled_tokens for seq in seqs)
-                      if is_prefill else -len(seqs))
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        # 吞吐显示：批内含 prefill chunk（任一 seq 调度 >1 token）记为 prefill，
+        # 否则为纯 decode（每 seq 1 token）。统一连续批下二者可混排，此处仅用于展示。
+        total = sum(num_scheduled.values())
+        is_prefill_step = any(n > 1 for n in num_scheduled.values())
+        num_tokens = total if is_prefill_step else -len(seqs)
+        token_ids = self.worker.call("run", seqs)
+        self.scheduler.postprocess(seqs, token_ids, num_scheduled)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 

@@ -1,58 +1,59 @@
 """
-Context 工具函数单元测试
+AttentionMetadata 数据类单元测试
 """
 import pytest
 import torch
 
-from nanovllm.utils.context import Context, set_context, get_context, reset_context
+from nanovllm.utils.context import AttentionMetadata
 
 
-class TestContext:
-
-    @pytest.mark.unit
-    def test_default_context_is_decode(self):
-        reset_context()
-        ctx = get_context()
-        assert not ctx.is_prefill
-        assert ctx.cu_seqlens_q is None
-        assert ctx.slot_mapping is None
-        assert ctx.max_seqlen_q == 0
+class TestAttentionMetadata:
 
     @pytest.mark.unit
-    def test_set_prefill_context(self):
-        cu_q = torch.tensor([0, 3, 7], dtype=torch.int32)
+    def test_default_is_empty(self):
+        md = AttentionMetadata()
+        assert md.query_start_loc is None
+        assert md.cu_seqlens_k is None
+        assert md.slot_mapping is None
+        assert md.block_table is None
+        assert md.max_query_len == 0
+        assert md.max_seq_len == 0
+
+    @pytest.mark.unit
+    def test_prefill_like_metadata(self):
+        # 两个 prefill 序列：长度 3 和 4
+        qsl = torch.tensor([0, 3, 7], dtype=torch.int32)
         cu_k = torch.tensor([0, 3, 7], dtype=torch.int32)
         sm = torch.arange(7, dtype=torch.int32)
-        set_context(True, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-                    max_seqlen_q=4, max_seqlen_k=4, slot_mapping=sm)
-        ctx = get_context()
-        assert ctx.is_prefill
-        assert ctx.max_seqlen_q == 4
-        assert torch.equal(ctx.cu_seqlens_q, cu_q)
-        reset_context()
+        md = AttentionMetadata(
+            query_start_loc=qsl, cu_seqlens_k=cu_k,
+            max_query_len=4, max_seq_len=4, slot_mapping=sm,
+        )
+        assert md.max_query_len == 4
+        assert torch.equal(md.query_start_loc, qsl)
+        assert torch.equal(md.cu_seqlens_k, cu_k)
+        assert not md.is_decode_only
 
     @pytest.mark.unit
-    def test_set_decode_context(self):
-        sm = torch.tensor([10, 20], dtype=torch.int32)
-        set_context(False, slot_mapping=sm)
-        ctx = get_context()
-        assert not ctx.is_prefill
-        assert torch.equal(ctx.slot_mapping, sm)
-        reset_context()
+    def test_decode_only_metadata(self):
+        # 三个 decode 序列：query 长度均为 1，KV 累计长度 [0,10,30,60]
+        qsl = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        cu_k = torch.tensor([0, 10, 30, 60], dtype=torch.int32)
+        sm = torch.tensor([10, 20, 30], dtype=torch.int32)
+        md = AttentionMetadata(
+            query_start_loc=qsl, cu_seqlens_k=cu_k,
+            max_query_len=1, max_seq_len=30, slot_mapping=sm,
+        )
+        assert md.is_decode_only
+        assert torch.equal(md.slot_mapping, sm)
 
     @pytest.mark.unit
-    def test_reset_clears_all_fields(self):
-        set_context(True, max_seqlen_q=99)
-        reset_context()
-        ctx = get_context()
-        assert not ctx.is_prefill
-        assert ctx.max_seqlen_q == 0
-        assert ctx.cu_seqlens_q is None
+    def test_mixed_batch_not_decode_only(self):
+        # 混合批：一个 prefill chunk(5) + 两个 decode(1,1)
+        md = AttentionMetadata(max_query_len=5)
+        assert not md.is_decode_only
 
     @pytest.mark.unit
-    def test_context_is_global_singleton(self):
-        set_context(True, max_seqlen_q=42)
-        ctx1 = get_context()
-        ctx2 = get_context()
-        assert ctx1 is ctx2
-        reset_context()
+    def test_block_table_none_means_no_cache(self):
+        md = AttentionMetadata(max_query_len=4)
+        assert md.block_table is None

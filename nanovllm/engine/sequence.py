@@ -45,7 +45,6 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
-        self.is_prefill = True
         self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -61,6 +60,15 @@ class Sequence:
     @property
     def is_finished(self) -> bool:
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def is_prefill(self) -> bool:
+        """prompt 尚未全部写入 KV cache → 仍处于 prefill 阶段（含 chunked prefill 中途）。
+
+        统一连续批后不再有显式 prefill/decode 标志，该属性由调度进度派生，
+        仅用于 __getstate__ 的 pickle 优化（decode 只传 last_token）。
+        """
+        return self.num_cached_tokens < self.num_prompt_tokens
 
     @property
     def num_completion_tokens(self) -> int:

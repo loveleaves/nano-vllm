@@ -36,32 +36,52 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> tuple[list[Sequence], dict[int, int]]:
         """
-        核心调度逻辑，返回 (scheduled_seqs, is_prefill)。
+        统一连续批调度，返回 (scheduled_seqs, num_scheduled[seq_id]→本步 token 数)。
 
-        --- Prefill 阶段（优先） ---
-          贪心调度 waiting 队列：
-          1. 检查 token 预算（max_num_batched_tokens）
-          2. can_allocate 检查内存 + 探测前缀缓存
-          3. 只允许第一个 seq 分块（Chunked Prefill）
-          4. 分配 KV 块，设置 num_scheduled_tokens
-          5. 处理完整 prompt → 移入 running，否则留在 waiting
+        无 prefill/decode 阶段切换：一个 batch 内可同时包含正在 decode 的 running
+        序列（query 长度 1）与正在 prefill chunk 的 waiting 序列（query 长度 >1）。
 
-        --- Decode 阶段 ---
-          对 running 每个 seq 调度 1 token：
-          1. can_append 检查空闲块
-          2. 不足则抢占 running 末尾 seq（preempt）
-          3. may_append 按需分配新块
+        --- 1) RUNNING：decode ---
+          每个 running seq 调度 1 token；can_append 不足则抢占 running 末尾。
+        --- 2) WAITING：prefill chunk（用剩余预算）---
+          can_allocate 探测前缀缓存；按剩余 token 预算切 chunk（任意 seq 可分块）；
+          完成整个 prompt → 移入 running，否则留在 waiting 续算。
         """
         scheduled_seqs = []
+        num_scheduled: dict[int, int] = {}
         num_batched_tokens = 0
 
-        # ── Prefill ──────────────────────────────────────────────────────────
+        # ── 1) RUNNING：decode ───────────────────────────────────────────────
+        decode_scheduled = []
+        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+            if num_batched_tokens + 1 > self.max_num_batched_tokens:
+                break
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    seq = None
+                    break
+            if seq is None:
+                break
+            seq.num_scheduled_tokens = 1
+            self.block_manager.may_append(seq)
+            scheduled_seqs.append(seq)
+            decode_scheduled.append(seq)
+            num_scheduled[seq.seq_id] = 1
+            num_batched_tokens += 1
+        # 本步 decode 的 running seq 放回 running 队列（保持原序）
+        self.running.extendleft(reversed(decode_scheduled))
+
+        # ── 2) WAITING：prefill chunk（剩余预算）─────────────────────────────
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
+            if remaining <= 0:
                 break
 
             if not seq.block_table:
@@ -73,73 +93,53 @@ class Scheduler:
                 # 分块 prefill 的后续 chunk：继续处理剩余部分
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
 
-            # 只有第一个 seq（scheduled_seqs 为空）允许分块
-            if remaining < num_tokens and scheduled_seqs:
+            n = min(num_tokens, remaining)
+            if n <= 0:
                 break
 
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
 
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = n
+            num_batched_tokens += n
 
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                # 本步完成整个 prompt（或最后一个 chunk）
+            if seq.num_cached_tokens + n == seq.num_tokens:
+                # 本步完成整个 prompt（或最后一个 chunk）→ 转入 decode 队列
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
+            # 否则 chunk 未完成，seq 留在 waiting 队头，下一步续算
 
             scheduled_seqs.append(seq)
+            num_scheduled[seq.seq_id] = n
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # waiting 中有 seq 但内存不足，且 running 为空 → 无法继续
-        if self.waiting and not self.running:
-            return [], True
-
-        # ── Decode ───────────────────────────────────────────────────────────
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs, num_scheduled
 
     def preempt(self, seq: Sequence):
         """
         将 seq 从 running 撤回：释放 KV 块，重置状态，推回 waiting 头部。
+        deallocate 会把 num_cached_tokens 归零，故 is_prefill 自动恢复为 True。
         前缀缓存的块 hash 保留，下次调度大概率再次命中。
         """
         seq.status = SequenceStatus.WAITING
-        seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int],
+                    num_scheduled: dict[int, int]):
         """
         每步推理后更新序列状态：
           1. hash_blocks：注册本步新填满块的哈希
           2. 更新 num_cached_tokens，清零 num_scheduled_tokens
-          3. 若是 chunked prefill 中间步，不追加 token（继续等待）
+          3. 若仍处于 prefill（chunk 未覆盖完整 prompt），不追加 token
           4. 否则追加新 token，检查终止条件
         """
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            # chunked prefill 未完成整个 prompt，本步不产出新 token
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            # chunked prefill 未覆盖完整 prompt（is_prefill 由进度派生），本步不产 token
+            if seq.is_prefill:
                 continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or \

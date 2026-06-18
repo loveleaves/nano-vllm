@@ -118,7 +118,7 @@ class TestSequencePickle:
         seq.block_table = [0, 1]
         seq.num_cached_tokens = 2
         seq.num_scheduled_tokens = 2
-        seq.is_prefill = True
+        # num_cached_tokens(2) < num_prompt_tokens(4) → is_prefill 派生为 True
         state = seq.__getstate__()
         data = pickle.dumps(state)
         state2 = pickle.loads(data)
@@ -130,7 +130,8 @@ class TestSequencePickle:
     @pytest.mark.unit
     def test_pickle_decode_state_only_last_token(self):
         seq = Sequence([1, 2, 3, 4])
-        seq.is_prefill = False
+        # num_cached_tokens(4) >= num_prompt_tokens(4) → is_prefill 派生为 False（decode）
+        seq.num_cached_tokens = 4
         seq.last_token = 42
         state = seq.__getstate__()
         data = pickle.dumps(state)
@@ -144,7 +145,7 @@ class TestSequencePickle:
     def test_pickle_restores_block_table(self):
         seq = Sequence([1, 2, 3])
         seq.block_table = [5, 7]
-        seq.is_prefill = True
+        # 默认 num_cached_tokens(0) < num_prompt_tokens(3) → is_prefill 派生为 True
         seq2 = Sequence.__new__(Sequence)
         seq2.__setstate__(seq.__getstate__())
         assert seq2.block_table == [5, 7]

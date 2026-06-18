@@ -3,60 +3,35 @@ import torch
 
 
 @dataclass
-class Context:
+class AttentionMetadata:
     """
-    单步推理的全局上下文，在 model_runner.prepare_prefill/decode 中设置，
-    在 Attention.forward 和 ParallelLMHead.forward 中读取。
+    单步推理的 attention 元数据，由 ModelRunner.prepare_inputs 构造，
+    显式传入 model.forward → Attention.forward。取代旧的全局 Context 单例。
 
-    通过全局变量隐式传递，避免将推理元数据作为参数逐层传递。
+    统一连续批：prefill chunk 与 decode token 共用同一组字段，无 is_prefill 分支。
+    decode 序列即 query 长度为 1 的退化情形。
 
-    prefill 字段：
-      cu_seqlens_q/k  — [num_seqs+1]，累计序列长度（flash_attn_varlen 接口）
-      max_seqlen_q/k  — 本批次最大序列长度
-      slot_mapping    — [total_tokens]，每个 token 写入 KV cache 的绝对 slot 编号
-      block_tables    — [num_seqs, max_blocks]，前缀缓存时使用
-
-    decode 字段：
-      slot_mapping    — [num_seqs]，当前 token 写入的 slot
-      context_lens    — [num_seqs]，每个 seq 的 KV 总长度
-      block_tables    — [num_seqs, max_blocks]
+    字段：
+      query_start_loc — [num_seqs+1]，累计 query 长度（flash 的 cu_seqlens_q）。
+                        decode 批每段步长为 1。
+      cu_seqlens_k    — [num_seqs+1]，累计 KV 长度（flash 的 cu_seqlens_k）。
+                        每段 = num_cached_tokens + num_scheduled_tokens。
+                        （flash_attn 2.8.3 无 seqused_k 参数，故用累计形式。）
+      max_query_len   — 批内最大 query 长度。==1 即纯 decode 批（CUDA graph 可用）。
+      max_seq_len     — 批内最大 KV 总长度。CUDA graph 捕获时取 max_model_len
+                        （经验证：高估 max_seqlen_k 对 varlen kernel 安全）。
+      slot_mapping    — [total_tokens]，每个本步 token 写入 KV cache 的绝对 slot 编号。
+      block_table     — [num_seqs, max_blocks]，分页 KV 地址。
+                        None 表示无 KV cache（仅 warmup 阶段），attention 退回裸 k/v。
     """
-    is_prefill: bool = False
-    cu_seqlens_q: torch.Tensor | None = None
+    query_start_loc: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
-    max_seqlen_q: int = 0
-    max_seqlen_k: int = 0
+    max_query_len: int = 0
+    max_seq_len: int = 0
     slot_mapping: torch.Tensor | None = None
-    context_lens: torch.Tensor | None = None
-    block_tables: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
 
-
-_CONTEXT = Context()
-
-
-def get_context() -> Context:
-    return _CONTEXT
-
-
-def set_context(
-    is_prefill: bool,
-    cu_seqlens_q=None,
-    cu_seqlens_k=None,
-    max_seqlen_q: int = 0,
-    max_seqlen_k: int = 0,
-    slot_mapping=None,
-    context_lens=None,
-    block_tables=None,
-):
-    global _CONTEXT
-    _CONTEXT = Context(
-        is_prefill, cu_seqlens_q, cu_seqlens_k,
-        max_seqlen_q, max_seqlen_k,
-        slot_mapping, context_lens, block_tables,
-    )
-
-
-def reset_context():
-    """推理步结束后清空 Context，防止下步误读上步数据。"""
-    global _CONTEXT
-    _CONTEXT = Context()
+    @property
+    def is_decode_only(self) -> bool:
+        """批内所有 seq 的 query 长度均为 1 → 可走 CUDA graph。"""
+        return self.max_query_len == 1

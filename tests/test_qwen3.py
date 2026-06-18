@@ -4,9 +4,18 @@ Qwen3ForCausalLM 结构单元测试（微型 CPU 模型）
 import pytest
 import torch
 
-from nanovllm.utils.context import set_context, reset_context
+from nanovllm.utils.context import AttentionMetadata
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+
+
+def _prefill_md(cu_q):
+    cu_q = torch.as_tensor(cu_q, dtype=torch.int32)
+    seglen = cu_q[1:] - cu_q[:-1]
+    return AttentionMetadata(
+        query_start_loc=cu_q, cu_seqlens_k=cu_q.clone(),
+        max_query_len=int(seglen.max()), max_seq_len=int(seglen.max()),
+    )
 
 
 class FakeQwen3Config:
@@ -35,29 +44,24 @@ class TestQwen3Structure:
 
     @pytest.mark.unit
     def test_forward_output_shape(self):
-        reset_context()
         model = _fresh_model()
         N = 5
         input_ids = torch.randint(0, 100, (N,))
         positions = torch.arange(N)
-        set_context(is_prefill=True, cu_seqlens_q=torch.tensor([0, N], dtype=torch.int32))
-        hidden = model(input_ids, positions)
+        md = _prefill_md([0, N])
+        hidden = model(input_ids, positions, md)
         assert hidden.shape == (N, 32)
-        reset_context()
 
     @pytest.mark.unit
     def test_compute_logits_shape_per_seq(self):
-        reset_context()
         model = _fresh_model()
         N, batch = 7, 3
         input_ids = torch.randint(0, 100, (N,))
         positions = torch.arange(N)
-        cu_q = torch.tensor([0, 2, 5, 7], dtype=torch.int32)
-        set_context(is_prefill=True, cu_seqlens_q=cu_q)
-        hidden = model(input_ids, positions)
-        logits = model.compute_logits(hidden)
+        md = _prefill_md([0, 2, 5, 7])
+        hidden = model(input_ids, positions, md)
+        logits = model.compute_logits(hidden, md)
         assert logits.shape == (batch, 100)
-        reset_context()
 
     @pytest.mark.unit
     def test_packed_modules_mapping_keys(self):

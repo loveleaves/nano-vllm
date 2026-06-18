@@ -3,6 +3,7 @@ import torch.distributed as dist
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.kv_cache import FullAttentionSpec
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import AttentionMetadata
@@ -87,7 +88,7 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
-        """根据剩余显存计算并分配 KV cache 张量。"""
+        """根据剩余显存计算并分配 KV cache 张量（块字节/块数计算由 KVCacheSpec 承担）。"""
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
@@ -97,16 +98,20 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim",
                            hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = (2 * hf_config.num_hidden_layers * self.block_size *
-                       num_kv_heads * head_dim * hf_config.dtype.itemsize)
-        config.num_kvcache_blocks = int(
-            total * config.gpu_memory_utilization - used - peak + current
-        ) // block_bytes
+        num_layers = hf_config.num_hidden_layers
+
+        # KVCacheSpec 封装单层单块字节数与"显存 → 块数"反推（对齐 V1）
+        self.kv_cache_spec = FullAttentionSpec(
+            block_size=self.block_size, num_kv_heads=num_kv_heads,
+            head_dim=head_dim, dtype=hf_config.dtype,
+        )
+        available = int(total * config.gpu_memory_utilization - used - peak + current)
+        config.num_kvcache_blocks = self.kv_cache_spec.num_blocks_for_memory(
+            available, num_layers)
         assert config.num_kvcache_blocks > 0
 
         self.kv_cache = torch.empty(
-            2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
-            self.block_size, num_kv_heads, head_dim,
+            2, num_layers, *self.kv_cache_spec.kv_cache_shape(config.num_kvcache_blocks)[1:],
         )
         layer_id = 0
         for module in self.model.modules():

@@ -1,7 +1,7 @@
 """EngineCore 单元测试（CPU）。
 
-EngineCore 真实构造会拉起 Worker/ModelRunner（GPU + 多进程），故这里用 object.__new__
-绕过 __init__，注入真实 Scheduler（纯 Python）+ 假 Worker，只检验
+EngineCore 真实构造会经 Executor 拉起 Worker/ModelRunner（GPU + 多进程），故这里用
+object.__new__ 绕过 __init__，注入真实 Scheduler（纯 Python）+ 假 Executor，只检验
 add_request/step/abort 的调度执行逻辑与 EngineCoreOutputs 产出。
 """
 import pytest
@@ -13,14 +13,13 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.sampling_params import SamplingParams
 
 
-class FakeWorker:
-    """每个 seq 返回固定 token（模拟采样结果），不触碰 GPU。"""
+class FakeExecutor:
+    """execute_model 为每个 seq 返回固定 token（模拟采样结果），不触碰 GPU。"""
 
     def __init__(self, token: int):
         self.token = token
 
-    def call(self, method: str, seqs=None):
-        assert method == "run"
+    def execute_model(self, seqs):
         return [self.token for _ in seqs]
 
 
@@ -28,7 +27,7 @@ def _make_core(token: int, block_size=4, num_blocks=32,
                max_num_batched_tokens=64, eos=999) -> EngineCore:
     Sequence.block_size = block_size
     ec = object.__new__(EngineCore)
-    ec.worker = FakeWorker(token)
+    ec.executor = FakeExecutor(token)
     ec.scheduler = Scheduler(num_blocks, block_size, max_num_seqs=8,
                              max_num_batched_tokens=max_num_batched_tokens, eos=eos)
     ec.requests = {}

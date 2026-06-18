@@ -11,8 +11,6 @@ step() 产出 EngineCoreOutputs（每请求的新 token + 是否结束 + 结束�
 """
 import atexit
 
-import torch.multiprocessing as mp
-
 from nanovllm.config import Config
 from nanovllm.engine.core_types import (
     EngineCoreOutput,
@@ -20,36 +18,26 @@ from nanovllm.engine.core_types import (
     EngineCoreRequest,
     FinishReason,
 )
+from nanovllm.engine.executor import Executor
 from nanovllm.engine.sched import Scheduler, SchedulingPolicy
 from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.worker import Worker
 
 
 class EngineCore:
-    """持有 Scheduler + Worker 的调度执行核心。
+    """持有 Scheduler + Executor 的调度执行核心。
 
-    进程编排（多进程 TP）从原 LLMEngine 迁移至此：
-      rank 0（本进程）：Worker(rank=0)，broadcast + 本地推理 + 采样
-      rank 1..N（子进程）：Worker.loop()，经 ShmTransport 等待指令
+    进程编排下沉到 Executor（UniProc / MultiProc，按 TP 规模选择）：
+      EngineCore.step → executor.execute_model(seqs) → rank0 采样 token_ids
     """
 
     def __init__(self, config: Config):
         Sequence.block_size = config.kvcache_block_size
         self.config = config
 
-        self.ps: list = []
-        self.events: list = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=Worker, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-
-        # rank0 Worker 构造时完成 warmup → 填好 config.num_kvcache_blocks，
-        # 之后才能据此构建 Scheduler 的 BlockManager。
-        self.worker = Worker(config, 0, self.events)
+        # Executor 构造时完成各 rank Worker 初始化（含 rank0 warmup → 填好
+        # config.num_kvcache_blocks），之后才能据此构建 Scheduler 的 BlockManager。
+        executor_class = Executor.get_class(config)
+        self.executor = executor_class(config)
 
         self.scheduler = Scheduler(
             num_kvcache_blocks=config.num_kvcache_blocks,
@@ -65,12 +53,10 @@ class EngineCore:
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
     def exit(self):
-        if getattr(self, "worker", None) is None:
+        if getattr(self, "executor", None) is None:
             return
-        self.worker.call("exit")
-        self.worker = None
-        for p in self.ps:
-            p.join()
+        self.executor.shutdown()
+        self.executor = None
 
     # ── 请求管理 ──────────────────────────────────────────────────────────────
     def add_request(self, request: EngineCoreRequest):
@@ -99,7 +85,7 @@ class EngineCore:
         seqs = sched_output.scheduled_seqs
         # 记录每个 seq 本步前已产出的 completion 数，用于判定是否真的吐了新 token
         prev_completion = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
-        token_ids = self.worker.call("run", seqs)
+        token_ids = self.executor.execute_model(seqs)
         self.scheduler.update_from_output(sched_output, token_ids)
 
         outputs: list[EngineCoreOutput] = []

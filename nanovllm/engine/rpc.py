@@ -1,13 +1,16 @@
 """
-EngineCore ↔ Worker 的结构化 RPC 传输层。
+Executor ↔ Worker 的结构化 RPC 传输层。
 
 从原 ModelRunner 抽出（D：解耦执行器与通信）。传输用 SharedMemory + Event，
 序列化用 msgspec.msgpack（替换裸 pickle）：载荷复用 Sequence.__getstate__ 的轻量
 元组（全 int / list[int]），msgspec 原生可编码，更快更结构化且无任意代码执行风险。
 
-协议：rank0 broadcast(method, seqs, finished) → 各 rank>0 recv() 得到
-  (method, seqs, finished_seq_ids)。seqs=None 表示无参方法（如 "exit"）；
-  finished_seq_ids 为本步需回收行槽位的 seq_id 集合（随 "run" 一同广播给各 rank）。
+两条单向通道（进程隔离后 executor 不在 NCCL 组内、不内联任何 Worker）：
+  ShmTransport   — 广播：executor → 所有 worker rank。executor 为创建方（events 为各
+                   worker 的 Event 列表），worker 为打开方（events 为自身单个 Event）。
+                   broadcast(method, seqs, finished) → 各 worker recv() 得到三元组。
+  ResultChannel  — 回传：输出 rank（rank0，唯一采样者）→ executor。executor recv() 取回
+                   该 rank 的结果（"run"→token_ids，"num_kvcache_blocks"→int）。
 """
 import msgspec
 from multiprocessing.shared_memory import SharedMemory
@@ -21,8 +24,8 @@ class ShmTransport:
 
     def __init__(self, rank: int, events, create: bool):
         """
-        rank0：events 为 list[Event]（逐个 set 通知子进程）。
-        rank>0：events 为本进程单个 Event（wait/clear）。
+        executor（create=True）：events 为 list[Event]（逐个 set 通知各 worker）。
+        worker（create=False）：events 为本进程单个 Event（wait/clear）。
         """
         self.rank = rank
         self.events = events
@@ -73,5 +76,43 @@ class ShmTransport:
         self.shm.close()
 
     def unlink(self):
-        """仅 rank0 调用：释放共享内存段（需在所有 rank close 之后）。"""
+        """仅创建方（executor）调用：释放共享内存段。"""
+        self.shm.unlink()
+
+
+class ResultChannel:
+    """输出 rank → executor 的单向回传通道（SharedMemory + 单个 Event）。
+
+    载荷为任意 msgpack 可编码对象（"run" 的 token_ids: list[int]|None，
+    "num_kvcache_blocks" 的 int）。executor 创建并 recv，输出 worker 打开并 send。
+    """
+    SHM_NAME = "nanovllm_result"
+    SHM_SIZE = 2 ** 20
+
+    def __init__(self, event, create: bool, name: str | None = None):
+        self.event = event
+        name = name or self.SHM_NAME
+        self.shm = (SharedMemory(name=name, create=True, size=self.SHM_SIZE)
+                    if create else SharedMemory(name=name))
+
+    def send(self, obj):
+        """输出 worker：写入结果并通知 executor。"""
+        data = msgspec.msgpack.encode(obj)
+        n = len(data)
+        self.shm.buf[0:4] = n.to_bytes(4, "little")
+        self.shm.buf[4:n + 4] = data
+        self.event.set()
+
+    def recv(self):
+        """executor：等待并读取输出 rank 的结果。"""
+        self.event.wait()
+        n = int.from_bytes(self.shm.buf[0:4], "little")
+        obj = msgspec.msgpack.decode(bytes(self.shm.buf[4:n + 4]))
+        self.event.clear()
+        return obj
+
+    def close(self):
+        self.shm.close()
+
+    def unlink(self):
         self.shm.unlink()

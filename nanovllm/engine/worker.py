@@ -22,6 +22,9 @@ class Worker:
         """在本 rank 上执行一条指令。"""
         if method == "run":
             return self.model_runner.run(seqs, finished_seq_ids)
+        if method == "num_kvcache_blocks":
+            # warmup + allocate_kv_cache 后由 ModelRunner 填入；进程隔离时经此回传给 executor
+            return self.model_runner.config.num_kvcache_blocks
         if method == "exit":
             return self.model_runner.exit()   # del graphs + destroy_process_group
         raise ValueError(f"未知 RPC 方法: {method}")

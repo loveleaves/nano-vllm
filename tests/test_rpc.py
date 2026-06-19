@@ -1,9 +1,13 @@
 """
-ShmTransport 序列化往返单元测试（不依赖多进程 / SharedMemory）。
+ShmTransport 序列化往返 + ResultChannel 回传往返单元测试。
+（ShmTransport 编解码不依赖多进程；ResultChannel 用进程内 Event+SharedMemory 自收发。）
 """
+import multiprocessing as mp
+import os
+
 import pytest
 
-from nanovllm.engine.rpc import ShmTransport
+from nanovllm.engine.rpc import ResultChannel, ShmTransport
 from nanovllm.engine.sequence import Sequence
 from nanovllm.sampling_params import SamplingParams
 
@@ -77,3 +81,34 @@ class TestRpcEncodeDecode:
         seq.last_token = 9
         data = ShmTransport.encode("run", [seq])
         assert isinstance(data, (bytes, bytearray))
+
+
+class TestResultChannel:
+    """输出 rank → executor 回传通道的收发往返（进程内自收发）。"""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("payload", [[7, 42, 1000], None, 123, [0]])
+    def test_send_recv_roundtrip(self, payload):
+        # 用唯一 name，避免与并发运行的引擎实例（固定名 nanovllm_result）撞段
+        name = f"nanovllm_test_{os.getpid()}_a"
+        event = mp.get_context("spawn").Event()
+        chan = ResultChannel(event, create=True, name=name)
+        try:
+            chan.send(payload)          # 模拟输出 worker 写入
+            assert chan.recv() == payload   # executor 读取
+        finally:
+            chan.close()
+            chan.unlink()
+
+    @pytest.mark.unit
+    def test_event_cleared_after_recv(self):
+        name = f"nanovllm_test_{os.getpid()}_b"
+        event = mp.get_context("spawn").Event()
+        chan = ResultChannel(event, create=True, name=name)
+        try:
+            chan.send([1, 2])
+            chan.recv()
+            assert not event.is_set()   # recv 后事件复位，供下一轮 wait
+        finally:
+            chan.close()
+            chan.unlink()

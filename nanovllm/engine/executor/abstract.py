@@ -21,8 +21,15 @@ class Executor(ABC):
 
     @staticmethod
     def get_class(config: Config) -> type["Executor"]:
-        """按 TP 规模选择执行器后端（对齐 V1 distributed_executor_backend 分派）。"""
-        if config.tensor_parallel_size == 1:
+        """按 distributed_executor_backend 选择执行器后端（对齐 V1 分派）。
+
+        backend 为 None 时按 TP 自动选：TP=1→uni(单进程内联)，TP>1→mp(各 rank 子进程隔离)；
+        显式 "mp" 可让 TP=1 也走进程隔离。
+        """
+        backend = config.distributed_executor_backend
+        if backend is None:
+            backend = "uni" if config.tensor_parallel_size == 1 else "mp"
+        if backend == "uni":
             from nanovllm.engine.executor.uniproc_executor import UniProcExecutor
             return UniProcExecutor
         from nanovllm.engine.executor.multiproc_executor import MultiProcExecutor

@@ -116,16 +116,27 @@ class Sequence:
         """
         自定义 pickle 序列化（进程间通信优化）：
           prefill 时序列化完整 token_ids；decode 时只序列化 last_token。
+
+        采样标量随状态一并传输：进程隔离（distributed_executor_backend="mp"）下，
+        采样发生在 rank0 **子进程**里、吃的是反序列化后的 Sequence，故 prepare_sample
+        需要这些字段。注意惩罚类采样还需完整 token 历史，但 decode 仅传 last_token，
+        故惩罚在隔离模式下不可用（见 docs/arch_worker_isolation/design.md 边界）。
         """
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (self.seq_id, self.num_tokens, self.num_prompt_tokens,
                 self.num_cached_tokens, self.num_scheduled_tokens,
-                self.block_table, last_state)
+                self.block_table, last_state,
+                self.temperature, self.top_p, self.top_k,
+                self.presence_penalty, self.frequency_penalty,
+                self.repetition_penalty, self.logprobs)
 
     def __setstate__(self, state):
         (self.seq_id, self.num_tokens, self.num_prompt_tokens,
          self.num_cached_tokens, self.num_scheduled_tokens,
-         self.block_table, last_state) = state
+         self.block_table, last_state,
+         self.temperature, self.top_p, self.top_k,
+         self.presence_penalty, self.frequency_penalty,
+         self.repetition_penalty, self.logprobs) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

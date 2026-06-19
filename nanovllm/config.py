@@ -14,6 +14,9 @@ class Config:
       max_model_len          — 支持的最大序列长度
       gpu_memory_utilization — GPU 显存用于 KV cache 的比例
       tensor_parallel_size   — 张量并行 GPU 数量
+      distributed_executor_backend — 执行器后端："uni"(单进程内联) / "mp"(各 rank 子进程隔离)；
+                               None 时按 TP 自动选（TP=1→uni，TP>1→mp）。显式 "mp" 可让
+                               TP=1 也走进程隔离（对齐 V1，单卡可测隔离机制）
       enforce_eager          — 禁用 CUDA graph（调试用）
       kvcache_block_size     — 每个 KV cache 物理块包含的 token 数（256 的倍数）
       num_kvcache_blocks     — KV cache 物理块总数（运行时由 ModelRunner 填入）
@@ -27,6 +30,7 @@ class Config:
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
+    distributed_executor_backend: str | None = None
     enforce_eager: bool = False
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -38,6 +42,7 @@ class Config:
         assert os.path.isdir(self.model), f"模型路径不存在: {self.model}"
         assert self.kvcache_block_size % 256 == 0, "kvcache_block_size 必须是 256 的倍数"
         assert self.scheduling_policy in ("fcfs", "priority")
+        assert self.distributed_executor_backend in (None, "uni", "mp")
         assert 1 <= self.tensor_parallel_size <= 8
         assert 0.0 < self.gpu_memory_utilization <= 1.0
 

@@ -72,6 +72,9 @@ class TorchSDPAImpl(AttentionImpl):
 
 class TorchSDPABackend(AttentionBackend):
 
+    # SDPA 兜底后端：任意平台可用、不限 head_size、支持 fp16/bf16/fp32
+    supported_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+
     @staticmethod
     def get_name() -> str:
         return "torch_sdpa"

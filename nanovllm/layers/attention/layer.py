@@ -21,7 +21,10 @@ class Attention(nn.Module):
 
     def __init__(self, num_heads: int, head_dim: int, scale: float, num_kv_heads: int):
         super().__init__()
-        backend = get_attn_backend()
+        # 按 head_size/dtype/平台筛选后端（当前默认设备与 dtype 即模型构建环境）
+        backend = get_attn_backend(
+            head_size=head_dim, dtype=torch.get_default_dtype(),
+            device_type=torch.get_default_device().type)
         self.impl = backend.get_impl_cls()(num_heads, head_dim, scale, num_kv_heads)
         self.builder = backend.get_builder_cls()()
         self.k_cache = self.v_cache = torch.tensor([])

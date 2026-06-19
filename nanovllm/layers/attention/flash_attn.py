@@ -52,6 +52,9 @@ class FlashAttentionImpl(AttentionImpl):
 
 class FlashAttentionBackend(AttentionBackend):
 
+    # flash_attn 2.x：仅 fp16/bf16，head_size ≤ 256 且为 8 的倍数
+    supported_dtypes = [torch.float16, torch.bfloat16]
+
     @staticmethod
     def get_name() -> str:
         return "flash_attn"
@@ -63,3 +66,11 @@ class FlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type[AttentionMetadataBuilder]:
         return FlashAttentionMetadataBuilder
+
+    @classmethod
+    def is_available(cls, device_type: str) -> bool:
+        return device_type == "cuda" and HAS_FLASH_ATTN
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        return 0 < head_size <= 256 and head_size % 8 == 0

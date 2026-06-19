@@ -15,7 +15,10 @@ from nanovllm.layers.attention.common import CommonAttentionMetadata
 
 
 class AttentionBackend(ABC):
-    """后端静态工厂。"""
+    """后端静态工厂 + 能力查询（对齐 V1：按 head_size/dtype/平台筛选可用后端）。"""
+
+    # 支持的计算 dtype（空 = 不限）；子类按 kernel 约束覆盖
+    supported_dtypes: list[torch.dtype] = [torch.float16, torch.bfloat16, torch.float32]
 
     @staticmethod
     @abstractmethod
@@ -37,6 +40,26 @@ class AttentionBackend(ABC):
                            num_kv_heads: int, head_dim: int) -> tuple:
         """nano 默认 KV 布局：[2(k/v), num_blocks, block_size, num_kv_heads, head_dim]。"""
         return (2, num_blocks, block_size, num_kv_heads, head_dim)
+
+    # ── 能力查询（对齐 V1 AttentionBackend.supports_*）─────────────────────────
+    @classmethod
+    def is_available(cls, device_type: str) -> bool:
+        """该后端在当前平台是否可用（如 flash 需 cuda + 已安装）。默认始终可用。"""
+        return True
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        """支持的 head_size 列表（空 = 不限）。"""
+        return []
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        sizes = cls.get_supported_head_sizes()
+        return (not sizes) or head_size in sizes
+
+    @classmethod
+    def supports_dtype(cls, dtype: torch.dtype) -> bool:
+        return (not cls.supported_dtypes) or dtype in cls.supported_dtypes
 
 
 class AttentionMetadataBuilder(ABC):

@@ -12,11 +12,11 @@ class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         self.worker = Worker(self.config, rank=0)
 
-    def collective_rpc(self, method: str, seqs=None) -> list:
-        return [self.worker.execute(method, seqs)]
+    def collective_rpc(self, method: str, seqs=None, finished_seq_ids=None) -> list:
+        return [self.worker.execute(method, seqs, finished_seq_ids)]
 
-    def execute_model(self, seqs) -> list[int] | None:
-        return self.worker.execute("run", seqs)
+    def execute_model(self, seqs, finished_seq_ids=None) -> list[int] | None:
+        return self.worker.execute("run", seqs, finished_seq_ids)
 
     def shutdown(self) -> None:
         self.worker.execute("exit")

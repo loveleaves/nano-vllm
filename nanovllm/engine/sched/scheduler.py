@@ -40,6 +40,9 @@ class Scheduler(SchedulerInterface):
         self.block_manager = BlockManager(num_kvcache_blocks, block_size)
         self.waiting: RequestQueue = create_request_queue(policy)
         self.running: deque[Sequence] = deque()
+        # 上一步结束 / 中止、需在执行器持久批回收行槽位的 seq_id（schedule 时随
+        # 本步被抢占者一并下发，清空累积器）；对齐 V1 Scheduler.finished_req_ids
+        self.finished_req_ids: set[int] = set()
 
     # ── 接口实现 ──────────────────────────────────────────────────────────────
     def add_request(self, seq: Sequence):
@@ -65,6 +68,9 @@ class Scheduler(SchedulerInterface):
         num_scheduled: dict[int, int] = {}
         preempted_seq_ids: set[int] = set()
         num_batched_tokens = 0
+        # 排空上一步累积的结束/中止 seq_id，本步随被抢占者一并下发给 InputBatch 回收
+        finished_seq_ids = self.finished_req_ids
+        self.finished_req_ids = set()
 
         # ── 1) RUNNING：decode ───────────────────────────────────────────────
         decode_scheduled = []
@@ -134,6 +140,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled,
             total_num_scheduled_tokens=num_batched_tokens,
             preempted_seq_ids=preempted_seq_ids,
+            finished_seq_ids=finished_seq_ids | preempted_seq_ids,
         )
 
     def preempt(self, seq: Sequence):
@@ -157,6 +164,7 @@ class Scheduler(SchedulerInterface):
             self.running.remove(seq)
         if seq in self.waiting:
             self.waiting.remove_request(seq)
+        self.finished_req_ids.add(seq.seq_id)
 
     def update_from_output(self, output: SchedulerOutput, token_ids: list[int]):
         """
@@ -180,3 +188,4 @@ class Scheduler(SchedulerInterface):
                 self.block_manager.deallocate(seq)
                 if seq in self.running:
                     self.running.remove(seq)
+                self.finished_req_ids.add(seq.seq_id)

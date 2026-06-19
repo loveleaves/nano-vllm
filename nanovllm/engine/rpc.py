@@ -5,8 +5,9 @@ EngineCore ↔ Worker 的结构化 RPC 传输层。
 序列化用 msgspec.msgpack（替换裸 pickle）：载荷复用 Sequence.__getstate__ 的轻量
 元组（全 int / list[int]），msgspec 原生可编码，更快更结构化且无任意代码执行风险。
 
-协议：rank0 broadcast(method, seqs) → 各 rank>0 recv() 得到 (method, seqs)。
-  seqs=None 表示无参方法（如 "exit"）。
+协议：rank0 broadcast(method, seqs, finished) → 各 rank>0 recv() 得到
+  (method, seqs, finished_seq_ids)。seqs=None 表示无参方法（如 "exit"）；
+  finished_seq_ids 为本步需回收行槽位的 seq_id 集合（随 "run" 一同广播给各 rank）。
 """
 import msgspec
 from multiprocessing.shared_memory import SharedMemory
@@ -30,13 +31,15 @@ class ShmTransport:
 
     # ── 序列化（静态、可独立单测）──────────────────────────────────────────────
     @staticmethod
-    def encode(method: str, seqs: list[Sequence] | None) -> bytes:
+    def encode(method: str, seqs: list[Sequence] | None,
+               finished: set[int] | None = None) -> bytes:
         states = [s.__getstate__() for s in seqs] if seqs is not None else None
-        return msgspec.msgpack.encode((method, states))
+        finished_list = sorted(finished) if finished else None
+        return msgspec.msgpack.encode((method, states, finished_list))
 
     @staticmethod
-    def decode(data: bytes) -> tuple[str, list[Sequence] | None]:
-        method, states = msgspec.msgpack.decode(data)
+    def decode(data: bytes) -> tuple[str, list[Sequence] | None, set[int] | None]:
+        method, states, finished_list = msgspec.msgpack.decode(data)
         seqs = None
         if states is not None:
             seqs = []
@@ -44,25 +47,27 @@ class ShmTransport:
                 seq = Sequence.__new__(Sequence)
                 seq.__setstate__(st)
                 seqs.append(seq)
-        return method, seqs
+        finished = set(finished_list) if finished_list else None
+        return method, seqs, finished
 
     # ── 传输 ────────────────────────────────────────────────────────────────
-    def broadcast(self, method: str, seqs: list[Sequence] | None = None):
+    def broadcast(self, method: str, seqs: list[Sequence] | None = None,
+                  finished: set[int] | None = None):
         """rank0：写入 shm 并通知所有子进程。"""
-        data = self.encode(method, seqs)
+        data = self.encode(method, seqs, finished)
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n + 4] = data
         for event in self.events:
             event.set()
 
-    def recv(self) -> tuple[str, list[Sequence] | None]:
+    def recv(self) -> tuple[str, list[Sequence] | None, set[int] | None]:
         """rank>0：等待并读取一条指令。"""
         self.events.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
-        method, seqs = self.decode(bytes(self.shm.buf[4:n + 4]))
+        method, seqs, finished = self.decode(bytes(self.shm.buf[4:n + 4]))
         self.events.clear()
-        return method, seqs
+        return method, seqs, finished
 
     def close(self):
         self.shm.close()

@@ -19,7 +19,7 @@ class FakeExecutor:
     def __init__(self, token: int):
         self.token = token
 
-    def execute_model(self, seqs):
+    def execute_model(self, seqs, finished_seq_ids=None):
         return [self.token for _ in seqs]
 
 

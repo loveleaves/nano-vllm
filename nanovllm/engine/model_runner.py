@@ -3,9 +3,10 @@ import torch.distributed as dist
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.input_batch import InputBatch
 from nanovllm.engine.kv_cache import FullAttentionSpec
 from nanovllm.layers.attention import Attention
-from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.sample import Sampler, SamplingMetadata
 from nanovllm.utils.context import AttentionMetadata
 from nanovllm.utils.loader import load_model
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
@@ -58,6 +59,15 @@ class ModelRunner:
         load_model(self.model, config.model)
         self.sampler = Sampler()
 
+        # 跨步常驻的输入批：持久行槽位 + 增量块表 + 每步展开缓冲（对齐 V1 InputBatch）
+        max_num_blocks_per_req = (config.max_model_len + self.block_size - 1) // self.block_size
+        self.input_batch = InputBatch(
+            max_num_reqs=config.max_num_seqs,
+            max_num_blocks_per_req=max_num_blocks_per_req,
+            max_num_batched_tokens=config.max_num_batched_tokens,
+            block_size=self.block_size, device="cuda", pin_memory=True,
+        )
+
         self.warmup_model()
         self.allocate_kv_cache()
 
@@ -85,6 +95,7 @@ class ModelRunner:
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs)
+        self.input_batch.clear()   # 释放 warmup 占用的行，真正推理从空批开始
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -120,79 +131,56 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]) -> torch.Tensor:
+    def _to_cuda(self, data, dtype) -> torch.Tensor:
+        return torch.tensor(data, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
+
+    def prepare_sample(self, seqs: list[Sequence]) -> SamplingMetadata:
+        """从行序序列构造结构化 SamplingMetadata（仅 rank0 调用）。
+
+        整批无某项配置时该字段置 None / no_penalties，Sampler 据此整段跳过，
+        使 greedy / 纯温度采样的常见路径零额外开销。
         """
-        将“logical token → physical KV block”的映射表记录到context中，
-        attention层查找kv cache table找到所有kv
-        FlashAttention kernel 要求：
-            - batch 内所有 sequence 的 block_table shape 必须一致
-            - 所以必须用-1 padding
-        使用自定义SPDA可以不用padding
-        """
-        max_len = max(len(seq.block_table) for seq in seqs)
-        bt = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        return torch.tensor(bt, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        vocab_size = self.config.hf_config.vocab_size
+        eps = 1e-5
 
-    def prepare_inputs(self, seqs: list[Sequence]):
-        """
-        统一连续批输入构造（合并旧 prepare_prefill/prepare_decode）。
-
-        每个 seq 取其 query 段 [num_cached_tokens, num_cached_tokens+num_scheduled_tokens)：
-          - prefill chunk：num_scheduled_tokens 个 prompt token
-          - decode：num_scheduled_tokens==1，即最后一个 token
-        prefill chunk 与 decode token 混排在同一批，无 is_prefill 分支。
-
-        block_table：任一 seq 已分配 KV 块时构造（覆盖 prefill/decode/前缀缓存，
-        attention 统一从分页 cache 读）；仅 warmup（无 KV 块）时为 None，走裸 k/v。
-        """
-        input_ids, positions = [], []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = max_seqlen_k = 0
-        slot_mapping = []
-        has_cache = any(seq.block_table for seq in seqs)
-
-        for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
-            end = start + seqlen_q
-            seqlen_k = end  # KV 总长 = 已缓存 + 本步
-
-            if seq.token_ids:
-                input_ids.extend(seq[start:end])
-            else:
-                # rank>0 decode：仅 last_token 可用（seqlen_q==1）
-                input_ids.append(seq.last_token)
-            positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-
-            if not seq.block_table:
-                slot_mapping.extend([-1] * seqlen_q)
-            else:
-                for pos in range(start, end):
-                    block_id = seq.block_table[pos // self.block_size]
-                    slot_mapping.append(block_id * self.block_size + pos % self.block_size)
-
-        block_tables = self.prepare_block_tables(seqs) if has_cache else None
-
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        sm = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        attn_md = AttentionMetadata(
-            query_start_loc=cu_q, cu_seqlens_k=cu_k,
-            max_query_len=max_seqlen_q, max_seq_len=max_seqlen_k,
-            slot_mapping=sm, block_table=block_tables,
-        )
-        return input_ids, positions, attn_md
-
-    def prepare_sample(self, seqs: list[Sequence]) -> torch.Tensor:
         temps = [seq.temperature for seq in seqs]
-        return torch.tensor(temps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        greedy = [t < eps for t in temps]
+        all_greedy = all(greedy)
+        all_random = not any(greedy)
+        temperature = self._to_cuda(temps, torch.float32)
+
+        tp = [seq.top_p for seq in seqs]
+        top_p = None if all(x >= 1.0 for x in tp) else self._to_cuda(tp, torch.float32)
+
+        # top_k：<=0 或 >=vocab 视为关闭，关闭行填 vocab_size（apply_top_k_only 不掩码）
+        tk = [k if 0 < k < vocab_size else vocab_size for k in (seq.top_k for seq in seqs)]
+        top_k = None if all(k == vocab_size for k in tk) else self._to_cuda(tk, torch.int32)
+
+        freq = [seq.frequency_penalty for seq in seqs]
+        pres = [seq.presence_penalty for seq in seqs]
+        rep = [seq.repetition_penalty for seq in seqs]
+        no_penalties = all(f == 0.0 and p == 0.0 and r == 1.0
+                           for f, p, r in zip(freq, pres, rep))
+        prompt_ids = output_ids = None
+        freq_t = pres_t = rep_t = None
+        if not no_penalties:
+            prompt_ids = [seq.prompt_token_ids for seq in seqs]
+            output_ids = [seq.completion_token_ids for seq in seqs]
+            freq_t = self._to_cuda(freq, torch.float32)
+            pres_t = self._to_cuda(pres, torch.float32)
+            rep_t = self._to_cuda(rep, torch.float32)
+
+        lp = [seq.logprobs for seq in seqs if seq.logprobs is not None]
+        max_num_logprobs = min(max(lp), vocab_size - 1) if lp else None
+
+        return SamplingMetadata(
+            temperature=temperature, all_greedy=all_greedy, all_random=all_random,
+            top_p=top_p, top_k=top_k,
+            no_penalties=no_penalties, prompt_token_ids=prompt_ids,
+            output_token_ids=output_ids, frequency_penalties=freq_t,
+            presence_penalties=pres_t, repetition_penalties=rep_t,
+            max_num_logprobs=max_num_logprobs,
+        )
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor,
@@ -223,13 +211,24 @@ class ModelRunner:
         graph.replay()
         return self.model.compute_logits(gv["outputs"][:bs], attn_md)
 
-    def run(self, seqs: list[Sequence]) -> list[int] | None:
-        """单步推理接口（供 call() 调用）。统一连续批，无 is_prefill。"""
-        input_ids, positions, attn_md = self.prepare_inputs(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    def run(self, seqs: list[Sequence],
+            finished_seq_ids: set[int] | None = None) -> list[int] | None:
+        """单步推理接口。统一连续批，经常驻 InputBatch 增量构造输入。
+
+        finished_seq_ids — 上一步结束 / 本步被抢占的 seq_id，用于回收其持久行槽位。
+        模型按行序前向/采样，得到的行序 token 再按 seq_id 映射回入参 seqs 的顺序返回，
+        使上层 update_from_output 可直接与 scheduled_seqs zip。
+        """
+        self.input_batch.update(seqs, finished_seq_ids)
+        input_ids, positions, attn_md, ordered = self.input_batch.make_inputs(seqs)
         logits = self.run_model(input_ids, positions, attn_md)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        return token_ids
+        if self.rank != 0:
+            return None
+        sampling_metadata = self.prepare_sample(ordered)
+        sampler_output = self.sampler(logits, sampling_metadata)
+        row_tokens = sampler_output.sampled_token_ids.tolist()
+        tok_by_id = {seq.seq_id: tok for seq, tok in zip(ordered, row_tokens)}
+        return [tok_by_id[seq.seq_id] for seq in seqs]
 
     @torch.inference_mode()
     def capture_cudagraph(self):

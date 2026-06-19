@@ -19,7 +19,7 @@ class TestRpcEncodeDecode:
         seq.num_scheduled_tokens = 4
 
         data = ShmTransport.encode("run", [seq])
-        method, seqs = ShmTransport.decode(data)
+        method, seqs, _ = ShmTransport.decode(data)
 
         assert method == "run"
         assert len(seqs) == 1
@@ -37,7 +37,7 @@ class TestRpcEncodeDecode:
         seq.num_cached_tokens = 4          # decode：is_prefill 派生 False → 只传 last_token
         seq.last_token = 42
 
-        method, seqs = ShmTransport.decode(ShmTransport.encode("run", [seq]))
+        method, seqs, _ = ShmTransport.decode(ShmTransport.encode("run", [seq]))
         r = seqs[0]
         assert r.last_token == 42
         assert r.token_ids == []           # decode 不还原完整 token_ids
@@ -49,15 +49,25 @@ class TestRpcEncodeDecode:
         seqs = [Sequence([1, 2, 3]), Sequence([4, 5])]
         for s in seqs:
             s.num_scheduled_tokens = s.num_tokens
-        method, out = ShmTransport.decode(ShmTransport.encode("run", seqs))
+        method, out, _ = ShmTransport.decode(ShmTransport.encode("run", seqs))
         assert method == "run" and len(out) == 2
         assert out[0].num_tokens == 3 and out[1].num_tokens == 2
 
     @pytest.mark.unit
     def test_roundtrip_no_args(self):
         data = ShmTransport.encode("exit", None)
-        method, seqs = ShmTransport.decode(data)
-        assert method == "exit" and seqs is None
+        method, seqs, finished = ShmTransport.decode(data)
+        assert method == "exit" and seqs is None and finished is None
+
+    @pytest.mark.unit
+    def test_roundtrip_finished_seq_ids(self):
+        Sequence.block_size = 256
+        seq = Sequence([1, 2, 3])
+        seq.num_scheduled_tokens = 3
+        data = ShmTransport.encode("run", [seq], {3, 7})
+        method, seqs, finished = ShmTransport.decode(data)
+        assert method == "run" and len(seqs) == 1
+        assert finished == {3, 7}
 
     @pytest.mark.unit
     def test_encoded_is_bytes_and_compact(self):

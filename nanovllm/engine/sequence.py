@@ -51,6 +51,13 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # 采样配置（仅 rank0 采样用，不入 __getstate__）
+        self.top_p = sampling_params.top_p
+        self.top_k = sampling_params.top_k
+        self.presence_penalty = sampling_params.presence_penalty
+        self.frequency_penalty = sampling_params.frequency_penalty
+        self.repetition_penalty = sampling_params.repetition_penalty
+        self.logprobs = sampling_params.logprobs
 
     def __len__(self) -> int:
         return self.num_tokens
@@ -111,12 +118,14 @@ class Sequence:
           prefill 时序列化完整 token_ids；decode 时只序列化 last_token。
         """
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-                self.num_scheduled_tokens, self.block_table, last_state)
+        return (self.seq_id, self.num_tokens, self.num_prompt_tokens,
+                self.num_cached_tokens, self.num_scheduled_tokens,
+                self.block_table, last_state)
 
     def __setstate__(self, state):
-        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-         self.num_scheduled_tokens, self.block_table, last_state) = state
+        (self.seq_id, self.num_tokens, self.num_prompt_tokens,
+         self.num_cached_tokens, self.num_scheduled_tokens,
+         self.block_table, last_state) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

@@ -149,3 +149,4 @@ class TestSequencePickle:
         seq2 = Sequence.__new__(Sequence)
         seq2.__setstate__(seq.__getstate__())
         assert seq2.block_table == [5, 7]
+        assert seq2.seq_id == seq.seq_id   # seq_id 随状态还原，供 rank>0 InputBatch 索引行

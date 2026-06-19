@@ -19,11 +19,14 @@ class SchedulerOutput:
     num_scheduled_tokens      — seq_id → 本步调度的 token 数（decode 为 1，prefill 为 chunk 长）
     total_num_scheduled_tokens— 本步 token 总数（= sum(num_scheduled_tokens)）
     preempted_seq_ids         — 本步因显存不足被抢占回 waiting 的 seq_id
+    finished_seq_ids          — 需从执行器持久批回收行槽位的 seq_id（上步结束/中止
+                                + 本步被抢占）；随本步下发给各 rank 的 ModelRunner.InputBatch
     """
     scheduled_seqs: list[Sequence] = field(default_factory=list)
     num_scheduled_tokens: dict[int, int] = field(default_factory=dict)
     total_num_scheduled_tokens: int = 0
     preempted_seq_ids: set[int] = field(default_factory=set)
+    finished_seq_ids: set[int] = field(default_factory=set)
 
     @property
     def is_empty(self) -> bool:

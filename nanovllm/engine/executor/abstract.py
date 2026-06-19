@@ -34,13 +34,13 @@ class Executor(ABC):
         ...
 
     @abstractmethod
-    def collective_rpc(self, method: str, seqs=None) -> list:
+    def collective_rpc(self, method: str, seqs=None, finished_seq_ids=None) -> list:
         """向所有 rank 下发同一方法，返回各 rank 结果列表（rank0 在首位）。"""
         ...
 
-    def execute_model(self, seqs) -> list[int] | None:
+    def execute_model(self, seqs, finished_seq_ids=None) -> list[int] | None:
         """跑一步推理，返回 rank0 采样出的 token_ids。"""
-        return self.collective_rpc("run", seqs)[0]
+        return self.collective_rpc("run", seqs, finished_seq_ids)[0]
 
     @abstractmethod
     def shutdown(self) -> None:

@@ -18,10 +18,10 @@ class Worker:
         self.rank = rank
         self.model_runner = ModelRunner(config, rank)
 
-    def execute(self, method: str, seqs=None):
+    def execute(self, method: str, seqs=None, finished_seq_ids=None):
         """在本 rank 上执行一条指令。"""
         if method == "run":
-            return self.model_runner.run(seqs)
+            return self.model_runner.run(seqs, finished_seq_ids)
         if method == "exit":
             return self.model_runner.exit()   # del graphs + destroy_process_group
         raise ValueError(f"未知 RPC 方法: {method}")

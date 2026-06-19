@@ -85,7 +85,7 @@ class EngineCore:
         seqs = sched_output.scheduled_seqs
         # 记录每个 seq 本步前已产出的 completion 数，用于判定是否真的吐了新 token
         prev_completion = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
-        token_ids = self.executor.execute_model(seqs)
+        token_ids = self.executor.execute_model(seqs, sched_output.finished_seq_ids)
         self.scheduler.update_from_output(sched_output, token_ids)
 
         outputs: list[EngineCoreOutput] = []

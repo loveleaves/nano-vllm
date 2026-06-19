@@ -24,10 +24,10 @@ def _worker_proc_main(config: Config, rank: int, event):
     dist.barrier()                            # 等 rank0 创建共享内存段
     transport = ShmTransport(rank, event, create=False)
     while True:
-        method, seqs = transport.recv()
+        method, seqs, finished = transport.recv()
         if method == "exit":
             break
-        worker.execute(method, seqs)
+        worker.execute(method, seqs, finished)
     # 清理顺序与 rank0 对齐：close → barrier → 销毁进程组
     transport.close()
     dist.barrier()
@@ -53,13 +53,13 @@ class MultiProcExecutor(Executor):
         self.transport = ShmTransport(0, self.events, create=True)
         dist.barrier()
 
-    def collective_rpc(self, method: str, seqs=None) -> list:
-        self.transport.broadcast(method, seqs)
-        return [self.worker.execute(method, seqs)]
+    def collective_rpc(self, method: str, seqs=None, finished_seq_ids=None) -> list:
+        self.transport.broadcast(method, seqs, finished_seq_ids)
+        return [self.worker.execute(method, seqs, finished_seq_ids)]
 
-    def execute_model(self, seqs) -> list[int] | None:
-        self.transport.broadcast("run", seqs)
-        return self.worker.execute("run", seqs)
+    def execute_model(self, seqs, finished_seq_ids=None) -> list[int] | None:
+        self.transport.broadcast("run", seqs, finished_seq_ids)
+        return self.worker.execute("run", seqs, finished_seq_ids)
 
     def shutdown(self) -> None:
         self.transport.broadcast("exit")      # 通知子进程退出循环

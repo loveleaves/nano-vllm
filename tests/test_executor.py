@@ -34,3 +34,33 @@ def test_explicit_mp_backend_forces_isolation_at_tp1():
 @pytest.mark.unit
 def test_explicit_uni_backend():
     assert Executor.get_class(_cfg(tp=2, backend="uni")) is UniProcExecutor
+
+
+class _FakeProc:
+    def __init__(self, alive, exitcode=0):
+        self._alive = alive
+        self.exitcode = exitcode
+        self.terminated = False
+    def is_alive(self):
+        return self._alive
+    def terminate(self):
+        self.terminated = True
+
+
+@pytest.mark.unit
+def test_check_workers_alive_raises_and_terminates():
+    from nanovllm.engine.executor.multiproc_executor import MultiProcExecutor
+    ex = object.__new__(MultiProcExecutor)
+    alive, dead = _FakeProc(True), _FakeProc(False, exitcode=-9)
+    ex.ps = [alive, dead]
+    with pytest.raises(RuntimeError, match="worker 子进程异常退出"):
+        ex._check_workers_alive()
+    assert alive.terminated   # 存活的被终止，避免孤儿进程
+
+
+@pytest.mark.unit
+def test_check_workers_alive_noop_when_all_alive():
+    from nanovllm.engine.executor.multiproc_executor import MultiProcExecutor
+    ex = object.__new__(MultiProcExecutor)
+    ex.ps = [_FakeProc(True), _FakeProc(True)]
+    ex._check_workers_alive()   # 不抛错

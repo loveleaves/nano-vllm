@@ -225,7 +225,9 @@ nano-vllm 只实现了 (a)，**放弃了 (b)**——因为它 prefill 步独占�
 2. **（中价值）** 把首 chunk 全量 KV 分配改为按 chunk 增量分配，降低长 prompt 并发下的显存峰值与抢占率。
 3. **（中价值，新增）** 引入类似 `long_prefill_token_threshold` 的单 seq 每步上限，避免单条超长 prompt 独占整步预算。
 4. **（低成本）** 为“prompt 长度整除 block_size 且全命中前缀”的边界补测试，对齐 vLLM 的块对齐回退逻辑，避免 `num_scheduled_tokens==0` 隐患。
-5. **（文档）** 在 `detailed_design.md` 7.2 显式注明“当前 chunked prefill 不做 prefill/decode 混批”，避免读者误以为已具备 vLLM 同等收益。
+5. **（文档）** 注明“当前 chunked prefill 不做 prefill/decode 混批”，避免读者误以为已具备 vLLM 同等收益。
+
+> **后续更新（A 轮，2026-06）**：上文建议 #1 已落地——`schedule()` 改为统一连续批（先 running decode、再 waiting prefill chunk，混排同一 varlen 批），attention 统一 `flash_attn_varlen_func`。详见 [03_data_flow.md](03_data_flow.md) §六 与 [arch_alignment/](arch_alignment/)。本报告其余为 phase4（commit `f8d495d`）当时的状态分析，保留作历史记录。
 
 ---
 
@@ -242,7 +244,7 @@ nano-vllm 只实现了 (a)，**放弃了 (b)**——因为它 prefill 步独占�
 ## 参考来源
 
 - nano-vllm 源码：`nanovllm/engine/scheduler.py`、`model_runner.py`、`engine/sequence.py`、`layers/attention.py`、`utils/context.py`（commit `f8d495d`, phase4）
-- nano-vllm 设计文档：`docs/detailed_design.md` §7.1 前缀缓存、§7.2 Chunked Prefill
+- nano-vllm 设计文档：`docs/02_core_concepts.md` §2 前缀缓存、§3 统一连续批+Chunked Prefill
 - vLLM V1 源码（最新 main，`/home/cb/work/vllm/vllm`）：
   - `vllm/v1/core/sched/scheduler.py`（`schedule()` L336-265+，RUNNING L372-556，WAITING L558-)
   - `vllm/config/scheduler.py`（`enable_chunked_prefill` L84、`long_prefill_token_threshold` L80/L245、`max_num_partial_prefills` L70）

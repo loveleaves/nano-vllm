@@ -66,10 +66,22 @@ class MultiProcExecutor(Executor):
         # num_kvcache_blocks 回填引擎侧 config，供 EngineCore 据此构建 Scheduler。
         self.config.num_kvcache_blocks = self.collective_rpc("num_kvcache_blocks")[0]
 
+    def _check_workers_alive(self) -> None:
+        """探测 worker 子进程存活；任一异常退出则终止其余并抛错（避免永久阻塞）。"""
+        dead = [(rank, p.exitcode) for rank, p in enumerate(self.ps) if not p.is_alive()]
+        if dead:
+            for p in self.ps:
+                if p.is_alive():
+                    p.terminate()
+            raise RuntimeError(f"worker 子进程异常退出，ranks/exitcodes={dead}")
+
     def collective_rpc(self, method: str, seqs=None, finished_seq_ids=None) -> list:
-        """向所有 rank 广播指令，返回 [输出 rank 的结果]（与 UniProc 的列表契约一致）。"""
+        """向所有 rank 广播指令，返回 [输出 rank 的结果]（与 UniProc 的列表契约一致）。
+
+        轮询等待回传，期间探测 worker 存活——worker 崩溃时立即抛错而非永久阻塞。
+        """
         self.broadcast.broadcast(method, seqs, finished_seq_ids)
-        return [self.result.recv()]
+        return [self.result.recv(alive_check=self._check_workers_alive)]
 
     def execute_model(self, seqs, finished_seq_ids=None) -> list[int] | None:
         return self.collective_rpc("run", seqs, finished_seq_ids)[0]

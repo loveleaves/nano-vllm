@@ -32,6 +32,12 @@ class SamplingMetadata:
 
     top_p: torch.Tensor | None = None
     top_k: torch.Tensor | None = None
+    min_p: torch.Tensor | None = None        # [n] 最小概率阈值系数；None 表示整批关闭
+
+    # 行 → 随机数生成器（按请求 seed 持久化，跨步续流）；None/空表示无种子
+    generators: dict[int, torch.Generator] | None = None
+    # 行 → 该请求的禁止 token 序列列表；None 表示整批无 bad_words
+    bad_words_token_ids: dict[int, list[list[int]]] | None = None
 
     no_penalties: bool = True
     prompt_token_ids: list[list[int]] | None = None

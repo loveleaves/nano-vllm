@@ -49,6 +49,12 @@ class Executor(ABC):
         """跑一步推理，返回 rank0 采样出的 token_ids。"""
         return self.collective_rpc("run", seqs, finished_seq_ids)[0]
 
+    def execute_swap(self, blocks_to_swap_in, blocks_to_swap_out) -> None:
+        """执行本步 KV 块搬运（抢占换出 / 换回）。默认不支持（仅 UniProc 内联实现）。"""
+        if blocks_to_swap_in or blocks_to_swap_out:
+            raise NotImplementedError(
+                "swap 抢占仅 UniProc（TP=1 内联）支持；MultiProc 需扩展 RPC 载荷")
+
     @abstractmethod
     def shutdown(self) -> None:
         ...

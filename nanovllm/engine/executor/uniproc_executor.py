@@ -18,5 +18,9 @@ class UniProcExecutor(Executor):
     def execute_model(self, seqs, finished_seq_ids=None) -> list[int] | None:
         return self.worker.execute("run", seqs, finished_seq_ids)
 
+    def execute_swap(self, blocks_to_swap_in, blocks_to_swap_out) -> None:
+        if blocks_to_swap_in or blocks_to_swap_out:
+            self.worker.model_runner.execute_swap(blocks_to_swap_in, blocks_to_swap_out)
+
     def shutdown(self) -> None:
         self.worker.execute("exit")

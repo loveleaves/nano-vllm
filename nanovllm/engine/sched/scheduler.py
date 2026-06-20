@@ -32,14 +32,17 @@ class Scheduler(SchedulerInterface):
     def __init__(self, num_kvcache_blocks: int, block_size: int,
                  max_num_seqs: int = 512, max_num_batched_tokens: int = 16384,
                  eos: int = -1,
-                 policy: SchedulingPolicy = SchedulingPolicy.FCFS):
+                 policy: SchedulingPolicy = SchedulingPolicy.FCFS,
+                 num_swap_blocks: int = 0):
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.eos = eos
         self.block_size = block_size
-        self.block_manager = BlockManager(num_kvcache_blocks, block_size)
+        self.block_manager = BlockManager(num_kvcache_blocks, block_size, num_swap_blocks)
+        self.swap_enabled = num_swap_blocks > 0
         self.waiting: RequestQueue = create_request_queue(policy)
         self.running: deque[Sequence] = deque()
+        self.swapped: deque[Sequence] = deque()   # 已换出到 CPU、待换回的序列（FIFO）
         # 上一步结束 / 中止、需在执行器持久批回收行槽位的 seq_id（schedule 时随
         # 本步被抢占者一并下发，清空累积器）；对齐 V1 Scheduler.finished_req_ids
         self.finished_req_ids: set[int] = set()
@@ -52,10 +55,23 @@ class Scheduler(SchedulerInterface):
     add = add_request
 
     def get_num_unfinished_requests(self) -> int:
-        return len(self.waiting) + len(self.running)
+        return len(self.waiting) + len(self.running) + len(self.swapped)
+
+    def make_stats(self, num_scheduled_tokens: int = 0):
+        """聚合一份调度快照（运行/等待数 + KV 利用率），供 metrics 使用。"""
+        from nanovllm.engine.metrics import SchedulerStats
+        pool = self.block_manager.block_pool
+        total = len(pool.blocks)
+        return SchedulerStats(
+            num_running=len(self.running),
+            num_waiting=len(self.waiting),
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_gpu_blocks=total,
+            num_gpu_blocks_used=total - pool.get_num_free_blocks(),
+        )
 
     def is_finished(self) -> bool:
-        return not self.waiting and not self.running
+        return not self.waiting and not self.running and not self.swapped
 
     def schedule(self) -> SchedulerOutput:
         """
@@ -67,10 +83,23 @@ class Scheduler(SchedulerInterface):
         scheduled_seqs: list[Sequence] = []
         num_scheduled: dict[int, int] = {}
         preempted_seq_ids: set[int] = set()
+        swap_out_list: list[tuple[int, int]] = []
+        swap_in_list: list[tuple[int, int]] = []
         num_batched_tokens = 0
         # 排空上一步累积的结束/中止 seq_id，本步随被抢占者一并下发给 InputBatch 回收
         finished_seq_ids = self.finished_req_ids
         self.finished_req_ids = set()
+
+        # ── 0) SWAPPED：换回（恢复 decode，先于本步 RUNNING）──────────────────
+        # 已换出到 CPU 的序列按 FIFO 优先换回 GPU；换回得到的块槽位与抢占（phase 1）
+        # 新释放的块不相交，故同一步内无冲突。
+        if self.swapped:
+            while (self.swapped and len(self.running) < self.max_num_seqs
+                   and self.block_manager.can_swap_in(self.swapped[0])):
+                seq = self.swapped.popleft()
+                swap_in_list.extend(self.block_manager.swap_in(seq))
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
 
         # ── 1) RUNNING：decode ───────────────────────────────────────────────
         decode_scheduled = []
@@ -81,10 +110,10 @@ class Scheduler(SchedulerInterface):
             while not self.block_manager.can_append(seq):
                 if self.running:
                     victim = self.running.pop()
-                    self.preempt(victim)
+                    self.preempt(victim, swap_out_list)
                     preempted_seq_ids.add(victim.seq_id)
                 else:
-                    self.preempt(seq)
+                    self.preempt(seq, swap_out_list)
                     preempted_seq_ids.add(seq.seq_id)
                     seq = None
                     break
@@ -141,14 +170,28 @@ class Scheduler(SchedulerInterface):
             total_num_scheduled_tokens=num_batched_tokens,
             preempted_seq_ids=preempted_seq_ids,
             finished_seq_ids=finished_seq_ids | preempted_seq_ids,
+            blocks_to_swap_out=swap_out_list,
+            blocks_to_swap_in=swap_in_list,
         )
 
-    def preempt(self, seq: Sequence):
+    def preempt(self, seq: Sequence, swap_out_list: list[tuple[int, int]] | None = None):
         """
-        将 seq 从 running 撤回：释放 KV 块，重置状态，推回 waiting。
-        deallocate 会把 num_cached_tokens 归零，故 is_prefill 自动恢复为 True。
-        前缀缓存的块 hash 保留，下次调度大概率再次命中。
+        将 seq 从 running 撤回。两种策略：
+
+          - swap（num_swap_blocks>0 且 swap 区有空槽）：把 KV 块搬到 CPU swap 区，
+            **保留** num_cached_tokens，seq 进入 self.swapped 待换回（恢复 decode）。
+            搬运 (gpu_block_id, swap_slot) 收集进 swap_out_list 交执行器做 D2H。
+          - recompute（默认 / swap 区满）：deallocate 释放 KV 块、num_cached_tokens
+            归零（is_prefill 自动恢复 True），seq 推回 waiting 队首重算。
+
+        两种策略前缀缓存的块 hash 都保留，下次大概率再次命中。
         """
+        if self.swap_enabled and swap_out_list is not None \
+                and self.block_manager.can_swap_out(seq):
+            swap_out_list.extend(self.block_manager.swap_out(seq))
+            seq.status = SequenceStatus.WAITING
+            self.swapped.append(seq)
+            return
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.prepend_request(seq)
@@ -159,11 +202,17 @@ class Scheduler(SchedulerInterface):
         deallocate 对空 block_table 是安全的 no-op，故 waiting 中尚未分配的 seq 也可中止。
         """
         seq.status = SequenceStatus.FINISHED
-        self.block_manager.deallocate(seq)
-        if seq in self.running:
-            self.running.remove(seq)
-        if seq in self.waiting:
-            self.waiting.remove_request(seq)
+        if seq in self.swapped:
+            # 已换出：归还 swap 槽位到空闲池（无 GPU 块可释放）
+            slots = self.block_manager.swapped_slots.pop(seq.seq_id, [])
+            self.block_manager.free_swap_slots.extend(slots)
+            self.swapped.remove(seq)
+        else:
+            self.block_manager.deallocate(seq)
+            if seq in self.running:
+                self.running.remove(seq)
+            if seq in self.waiting:
+                self.waiting.remove_request(seq)
         self.finished_req_ids.add(seq.seq_id)
 
     def update_from_output(self, output: SchedulerOutput, token_ids: list[int]):

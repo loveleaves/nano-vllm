@@ -43,9 +43,27 @@ def apply_top_k_top_p(logits: torch.Tensor, k: torch.Tensor | None,
     return logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
 
 
-def random_sample(probs: torch.Tensor) -> torch.Tensor:
-    """Gumbel-max：probs / Exponential(1) 后取 argmax（向量化，无 CPU-GPU 同步）。"""
-    q = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
+def apply_min_p(logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+    """min-p 过滤：屏蔽 prob < min_p * max_prob 的 token（argmax 不变）。"""
+    probs = logits.softmax(dim=-1)
+    top_probs = probs.max(dim=-1, keepdim=True).values
+    threshold = min_p.unsqueeze(1) * top_probs
+    return logits.masked_fill(probs < threshold, -float("inf"))
+
+
+def random_sample(probs: torch.Tensor,
+                  generators: dict[int, torch.Generator] | None = None) -> torch.Tensor:
+    """Gumbel-max：probs / Exponential(1) 后取 argmax（向量化，无 CPU-GPU 同步）。
+
+    generators 非空时，对应行用各自的 torch.Generator 采样（可复现）；其余行用默认 RNG。
+    """
+    q = torch.empty_like(probs)
+    if not generators or len(generators) != probs.shape[0]:
+        q.exponential_(1)                     # 无种子的行先批量填充
+    if generators:
+        for i, g in generators.items():
+            q[i].exponential_(1, generator=g)  # 有种子的行覆盖为可复现采样
+    q.clamp_min_(1e-10)
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
@@ -53,7 +71,8 @@ class TopKTopPSampler(nn.Module):
     """top-k/top-p 过滤后做加权随机采样，返回采样 token id。"""
 
     def forward(self, logits: torch.Tensor, k: torch.Tensor | None,
-                p: torch.Tensor | None) -> torch.Tensor:
+                p: torch.Tensor | None,
+                generators: dict[int, torch.Generator] | None = None) -> torch.Tensor:
         logits = apply_top_k_top_p(logits, k, p)
         probs = logits.softmax(dim=-1)
-        return random_sample(probs)
+        return random_sample(probs, generators)

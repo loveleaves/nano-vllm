@@ -1,3 +1,5 @@
+import gc
+
 import torch
 import torch.distributed as dist
 
@@ -58,6 +60,8 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # 按请求 seed 持久化的随机数生成器（seq_id → Generator），跨步续流
+        self.generators: dict[int, torch.Generator] = {}
 
         # 跨步常驻的输入批：持久行槽位 + 增量块表 + 每步展开缓冲（对齐 V1 InputBatch）
         max_num_blocks_per_req = (config.max_model_len + self.block_size - 1) // self.block_size
@@ -78,10 +82,25 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
     def exit(self):
-        """释放 GPU 资源（graph/进程组）。RPC 传输的关闭由 Worker 负责。"""
+        """释放 GPU 资源（graph / KV cache / 模型 / 进程组）。RPC 传输的关闭由 Worker 负责。
+
+        显式释放显存并 empty_cache，使同进程可干净重建引擎（否则残留显存会让下个引擎
+        的 num_kvcache_blocks 估算 ≤ 0 而断言失败）。退出后本 runner 不应再被使用。
+        """
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+        # 解除 Attention 层对 KV cache 切片的引用，再释放 KV cache / 模型 / 输入批缓冲
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                module.k_cache = module.v_cache = None
+        self.kv_cache = None
+        self.cpu_kv_cache = None
+        self.model = None
+        self.input_batch = None
+        # nn.Module 间存在引用环，需 gc.collect() 才能释放模型权重显存，否则 empty_cache 无效
+        gc.collect()
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         dist.destroy_process_group()
 
     def warmup_model(self):
@@ -131,6 +150,42 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+        # CPU swap 区（pinned 内存，按 num_swap_blocks 分配；抢占换出/换入的落脚点）
+        self.cpu_kv_cache = None
+        if config.num_swap_blocks > 0:
+            self.cpu_kv_cache = torch.empty(
+                2, num_layers,
+                *self.kv_cache_spec.kv_cache_shape(config.num_swap_blocks)[1:],
+                device="cpu", pin_memory=True,
+            )
+
+    @torch.inference_mode()
+    def swap_out(self, blocks: list[tuple[int, int]]):
+        """抢占换出：把 GPU 块 D2H 拷到 CPU swap 槽（blocks=[(gpu_block_id, swap_slot)]）。
+        须在 execute_model 之前调用——此时块内仍是被换出序列的旧 KV。"""
+        if not blocks:
+            return
+        gpu_ids = torch.tensor([g for g, _ in blocks], device="cuda")
+        slots = torch.tensor([s for _, s in blocks], device="cpu")
+        # kv_cache/cpu_kv_cache 形状 [2, L, num_blocks, ...]，按 block 维 gather/scatter
+        gathered = self.kv_cache[:, :, gpu_ids].to("cpu")   # D2H（同步，落地后再写）
+        self.cpu_kv_cache[:, :, slots] = gathered
+
+    @torch.inference_mode()
+    def swap_in(self, blocks: list[tuple[int, int]]):
+        """换回：把 CPU swap 槽 H2D 拷到新分配的 GPU 块（blocks=[(gpu_block_id, swap_slot)]）。"""
+        if not blocks:
+            return
+        gpu_ids = torch.tensor([g for g, _ in blocks], device="cuda")
+        slots = torch.tensor([s for _, s in blocks], device="cpu")
+        gathered = self.cpu_kv_cache[:, :, slots].to("cuda")   # H2D（同步）
+        self.kv_cache[:, :, gpu_ids] = gathered
+
+    def execute_swap(self, blocks_to_swap_in, blocks_to_swap_out):
+        """成对执行本步 KV 搬运：先 swap_out（读旧 KV）再 swap_in。"""
+        self.swap_out(blocks_to_swap_out)
+        self.swap_in(blocks_to_swap_in)
+
     def _to_cuda(self, data, dtype) -> torch.Tensor:
         return torch.tensor(data, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
 
@@ -156,11 +211,21 @@ class ModelRunner:
         tk = [k if 0 < k < vocab_size else vocab_size for k in (seq.top_k for seq in seqs)]
         top_k = None if all(k == vocab_size for k in tk) else self._to_cuda(tk, torch.int32)
 
+        mp = [seq.min_p for seq in seqs]
+        min_p = None if all(x <= 0.0 for x in mp) else self._to_cuda(mp, torch.float32)
+
         freq = [seq.frequency_penalty for seq in seqs]
         pres = [seq.presence_penalty for seq in seqs]
         rep = [seq.repetition_penalty for seq in seqs]
         no_penalties = all(f == 0.0 and p == 0.0 and r == 1.0
                            for f, p, r in zip(freq, pres, rep))
+
+        # bad_words：行 → 该请求的禁止 token 序列
+        bad_words = {i: seq.bad_words_token_ids for i, seq in enumerate(seqs)
+                     if seq.bad_words_token_ids}
+        bad_words = bad_words or None
+
+        # 惩罚需 prompt+output 历史；bad_words 仅需 output 历史
         prompt_ids = output_ids = None
         freq_t = pres_t = rep_t = None
         if not no_penalties:
@@ -169,13 +234,29 @@ class ModelRunner:
             freq_t = self._to_cuda(freq, torch.float32)
             pres_t = self._to_cuda(pres, torch.float32)
             rep_t = self._to_cuda(rep, torch.float32)
+        elif bad_words is not None:
+            output_ids = [seq.completion_token_ids for seq in seqs]
+
+        # 持久 generator：按请求 seed 建一次，跨步续流（行 → generator）
+        generators = {}
+        for row, seq in enumerate(seqs):
+            if seq.seed is None:
+                continue
+            gen = self.generators.get(seq.seq_id)
+            if gen is None:
+                gen = torch.Generator(device="cuda")
+                gen.manual_seed(seq.seed)
+                self.generators[seq.seq_id] = gen
+            generators[row] = gen
+        generators = generators or None
 
         lp = [seq.logprobs for seq in seqs if seq.logprobs is not None]
         max_num_logprobs = min(max(lp), vocab_size - 1) if lp else None
 
         return SamplingMetadata(
             temperature=temperature, all_greedy=all_greedy, all_random=all_random,
-            top_p=top_p, top_k=top_k,
+            top_p=top_p, top_k=top_k, min_p=min_p,
+            generators=generators, bad_words_token_ids=bad_words,
             no_penalties=no_penalties, prompt_token_ids=prompt_ids,
             output_token_ids=output_ids, frequency_penalties=freq_t,
             presence_penalties=pres_t, repetition_penalties=rep_t,
@@ -211,14 +292,19 @@ class ModelRunner:
         graph.replay()
         return self.model.compute_logits(gv["outputs"][:bs], attn_md)
 
-    def run(self, seqs: list[Sequence],
-            finished_seq_ids: set[int] | None = None) -> list[int] | None:
+    def run(self, seqs: list[Sequence], finished_seq_ids: set[int] | None = None):
         """单步推理接口。统一连续批，经常驻 InputBatch 增量构造输入。
 
         finished_seq_ids — 上一步结束 / 本步被抢占的 seq_id，用于回收其持久行槽位。
         模型按行序前向/采样，得到的行序 token 再按 seq_id 映射回入参 seqs 的顺序返回，
         使上层 update_from_output 可直接与 scheduled_seqs zip。
+
+        返回 (token_ids, step_logprobs)（rank>0 返回 None）。step_logprobs 为按 seqs 对齐的
+        list[dict[int,float] | None]，整批无 logprobs 请求时为 None。
         """
+        if finished_seq_ids:                       # 回收已结束请求的持久 generator
+            for sid in finished_seq_ids:
+                self.generators.pop(sid, None)
         self.input_batch.update(seqs, finished_seq_ids)
         input_ids, positions, attn_md, ordered = self.input_batch.make_inputs(seqs)
         logits = self.run_model(input_ids, positions, attn_md)
@@ -228,7 +314,19 @@ class ModelRunner:
         sampler_output = self.sampler(logits, sampling_metadata)
         row_tokens = sampler_output.sampled_token_ids.tolist()
         tok_by_id = {seq.seq_id: tok for seq, tok in zip(ordered, row_tokens)}
-        return [tok_by_id[seq.seq_id] for seq in seqs]
+        token_ids = [tok_by_id[seq.seq_id] for seq in seqs]
+
+        # logprobs：按 seq_id 映射回入参顺序；未请求 logprobs 的 seq 置 None（整批未请求则为 None）
+        step_logprobs = None
+        lt = sampler_output.logprobs_tensors
+        if lt is not None:
+            ids = lt.logprob_token_ids.tolist()   # [n, 1+k]
+            vals = lt.logprobs.tolist()            # [n, 1+k]
+            lp_by_id = {ordered[r].seq_id: dict(zip(ids[r], vals[r]))
+                        for r in range(len(ordered))}
+            step_logprobs = [lp_by_id[s.seq_id] if s.logprobs is not None else None
+                             for s in seqs]
+        return token_ids, step_logprobs
 
     @torch.inference_mode()
     def capture_cudagraph(self):

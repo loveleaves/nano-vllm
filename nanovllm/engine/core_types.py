@@ -43,6 +43,9 @@ class EngineCoreOutput:
     new_token_ids: list[int]
     finished: bool = False
     finish_reason: FinishReason | None = None
+    # 本步采样 token 的 logprobs：token_id → logprob（含采样 token + top-k），
+    # 仅当请求设置了 SamplingParams.logprobs 时非 None
+    logprobs: dict[int, float] | None = None
 
 
 @dataclass
@@ -70,3 +73,5 @@ class RequestOutput:
     delta_text: str = ""
     finished: bool = False
     finish_reason: FinishReason | None = None
+    # 每个输出 token 一个 dict（token_id → logprob，含采样 token + top-k）；未请求时为 None
+    logprobs: list[dict[int, float]] | None = None

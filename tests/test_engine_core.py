@@ -20,7 +20,7 @@ class FakeExecutor:
         self.token = token
 
     def execute_model(self, seqs, finished_seq_ids=None):
-        return [self.token for _ in seqs]
+        return [self.token for _ in seqs], None
 
 
 def _make_core(token: int, block_size=4, num_blocks=32,

@@ -27,6 +27,9 @@ class RequestState:
         self.prompt_token_ids = request.prompt_token_ids
         self.sampling_params = request.sampling_params
         self.detokenizer = IncrementalDetokenizer(tokenizer)
+        # 累计每个输出 token 的 logprobs（请求未设 logprobs 时保持 None）
+        self.logprobs: list[dict[int, float]] | None = (
+            [] if request.sampling_params.logprobs is not None else None)
 
 
 @dataclass
@@ -68,6 +71,8 @@ class OutputProcessor:
             token_ids = list(st.detokenizer.output_token_ids)
             finished = out.finished
             finish_reason = out.finish_reason
+            if st.logprobs is not None and out.logprobs is not None:
+                st.logprobs.append(out.logprobs)
 
             # 停止串：在累计文本中检测，命中则截断（不含停止串）并提前结束
             stop_str = check_stop_strings(cum_text, st.sampling_params.stop)
@@ -87,6 +92,7 @@ class OutputProcessor:
                 delta_text=delta,
                 finished=finished,
                 finish_reason=finish_reason,
+                logprobs=list(st.logprobs) if st.logprobs is not None else None,
             ))
             if finished:
                 self.request_states.pop(out.request_id, None)

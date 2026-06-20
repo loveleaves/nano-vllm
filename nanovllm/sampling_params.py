@@ -17,7 +17,10 @@ class SamplingParams:
       presence_penalty   — 存在惩罚（出现过即扣分）
       frequency_penalty  — 频率惩罚（按出现次数扣分）
       repetition_penalty — 重复惩罚（>1 抑制重复，=1 关闭）
+      min_p              — 最小概率阈值：保留 prob >= min_p * max_prob 的 token（0 关闭）
       logprobs           — 每步返回的 top-logprobs 个数（None 不返回）
+      seed               — 随机采样种子（None 不固定）；同一请求跨步用持久 generator 续流
+      bad_words_token_ids— 禁止生成的 token 序列列表；某序列前缀匹配已生成尾部时屏蔽其末 token
     """
     temperature: float = 1.0
     max_tokens: int = 64
@@ -28,13 +31,17 @@ class SamplingParams:
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    min_p: float = 0.0
     logprobs: int | None = None
+    seed: int | None = None
+    bad_words_token_ids: list[list[int]] | None = None
 
     def __post_init__(self):
         assert self.temperature >= 0.0, "temperature 必须 >= 0（0 表示 greedy）"
         assert self.max_tokens > 0, "max_tokens 必须大于 0"
         assert 0.0 < self.top_p <= 1.0, "top_p 必须落在 (0, 1]"
         assert self.repetition_penalty > 0.0, "repetition_penalty 必须 > 0"
+        assert 0.0 <= self.min_p <= 1.0, "min_p 必须落在 [0, 1]"
         assert self.logprobs is None or self.logprobs >= 0, "logprobs 必须 >= 0"
         if isinstance(self.stop, str):
             self.stop = [self.stop]

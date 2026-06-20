@@ -3,8 +3,9 @@ import pytest
 import torch
 
 from nanovllm.layers.sample import Sampler, SamplingMetadata
+from nanovllm.layers.sample.ops.bad_words import apply_bad_words
 from nanovllm.layers.sample.ops.penalties import apply_all_penalties
-from nanovllm.layers.sample.ops.topk_topp import apply_top_k_top_p
+from nanovllm.layers.sample.ops.topk_topp import apply_min_p, apply_top_k_top_p, random_sample
 
 
 def _greedy_md(n):
@@ -90,6 +91,65 @@ class TestTopKTopP:
         md = _random_md(200, temp=1.0, top_k=torch.tensor([2] * 200))
         out = sampler(logits, md)
         assert set(out.sampled_token_ids.tolist()) <= {4, 5}
+
+
+class TestMinP:
+
+    @pytest.mark.unit
+    def test_min_p_masks_low_prob_tokens(self):
+        # 一个 token 概率压倒性 → min_p=0.5 屏蔽其余
+        logits = torch.tensor([[0.0, 0.0, 10.0, 0.0]])
+        out = apply_min_p(logits.clone(), torch.tensor([0.5]))
+        assert out[0, 2] == 10.0
+        assert torch.isinf(out[0, [0, 1, 3]]).all()
+
+    @pytest.mark.unit
+    def test_min_p_zero_keeps_all(self):
+        logits = torch.randn(1, 8)
+        out = apply_min_p(logits.clone(), torch.tensor([0.0]))
+        assert torch.equal(out, logits)   # min_p=0 不屏蔽任何 token
+
+
+class TestSeedGenerators:
+
+    @pytest.mark.unit
+    def test_random_sample_with_generator_reproducible(self):
+        probs = torch.softmax(torch.randn(1, 50), dim=-1)
+        g1 = torch.Generator(); g1.manual_seed(123)
+        g2 = torch.Generator(); g2.manual_seed(123)
+        t1 = random_sample(probs.clone(), {0: g1})
+        t2 = random_sample(probs.clone(), {0: g2})
+        assert torch.equal(t1, t2)        # 同种子 → 同结果（可复现）
+
+    @pytest.mark.unit
+    def test_sampler_seed_reproducible(self):
+        sampler = Sampler()
+        logits = torch.randn(2, 100)
+        def run():
+            g = {0: torch.Generator(), 1: torch.Generator()}
+            g[0].manual_seed(7); g[1].manual_seed(8)
+            md = SamplingMetadata(temperature=torch.ones(2), all_greedy=False,
+                                  all_random=True, generators=g)
+            return sampler(logits.clone(), md).sampled_token_ids
+        assert torch.equal(run(), run())
+
+
+class TestBadWords:
+
+    @pytest.mark.unit
+    def test_single_token_bad_word_always_masked(self):
+        logits = torch.zeros(1, 5)
+        out = apply_bad_words(logits.clone(), {0: [[3]]}, [[1, 2]])
+        assert torch.isinf(out[0, 3]) and not torch.isinf(out[0, 0])
+
+    @pytest.mark.unit
+    def test_multi_token_bad_word_masks_on_prefix_match(self):
+        # 禁止序列 [2,3]：仅当已生成尾部为 [2] 时屏蔽 3
+        logits = torch.zeros(2, 5)
+        out = apply_bad_words(logits.clone(), {0: [[2, 3]], 1: [[2, 3]]},
+                              [[9, 2], [9, 9]])   # row0 尾部=2(匹配)，row1 不匹配
+        assert torch.isinf(out[0, 3])             # row0：屏蔽 3
+        assert not torch.isinf(out[1, 3])         # row1：不屏蔽
 
 
 class TestPenalties:

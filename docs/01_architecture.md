@@ -2,7 +2,9 @@
 
 ## 项目概述
 
-nano-vllm 是一个用 ~1200 行 Python 从零实现的轻量级 LLM 推理引擎，性能与 vLLM 持平甚至更快（Qwen3-0.6B 上 1434 vs 1362 tok/s）。目标是在极简代码量下还原 vLLM 的核心技术栈。
+nano-vllm 是一个用精简 Python 从零实现的轻量级 LLM 推理引擎，性能与 vLLM 持平甚至更快（Qwen3-0.6B 上 1434 vs 1362 tok/s）。目标是在极小代码量下还原 vLLM 的核心技术栈。
+
+`phase5` 分支在保持单模型(Qwen3)单节点定位的前提下，按 vLLM 0.15.1（V1 架构）逐层对齐了**分层骨架**（引擎组件拆分 + 异步通路、调度器子包、KV cache 三层、Executor 抽象 + 进程隔离、持久化 InputBatch、结构化采样层、Attention 后端注册表），engine/attention/sample 合计约 3200 行。逐项对齐说明见 [nano_vs_vllm-架构对比](nano_vs_vllm-架构对比-20260618.md) 与 `arch_*/` 各专题。
 
 **依赖栈：**
 
@@ -20,32 +22,42 @@ nano-vllm 是一个用 ~1200 行 Python 从零实现的轻量级 LLM 推理引�
 
 ```
 nanovllm/
-├── __init__.py           # 对外暴露 LLM, SamplingParams
+├── __init__.py           # 对外暴露 LLM, AsyncLLM, SamplingParams, RequestOutput
 ├── llm.py                # LLM 入口（透传继承 LLMEngine）
-├── config.py             # 全局配置 Config dataclass
-├── sampling_params.py    # 采样参数 SamplingParams dataclass
+├── config.py             # 全局配置 Config（含 scheduling_policy / distributed_executor_backend）
+├── sampling_params.py    # 采样参数（temperature/top_p/top_k/penalties/logprobs/stop）
 │
-├── engine/               # 推理引擎核心
+├── engine/               # 推理引擎核心（V1 风格组件拆分）
 │   ├── sequence.py       # Sequence：单个请求的完整生命周期状态
-│   ├── block_manager.py  # BlockManager：KV cache 分页管理 + 前缀缓存
-│   ├── scheduler.py      # Scheduler：调度 prefill/decode，管理抢占
-│   ├── llm_engine.py     # LLMEngine：引擎主循环，协调各组件
-│   └── model_runner.py   # ModelRunner：GPU 推理，管理 CUDA Graph
+│   ├── core_types.py     # EngineCoreRequest/Output(s)、RequestOutput、FinishReason 契约
+│   ├── processor.py      # Processor：tokenize → EngineCoreRequest
+│   ├── core.py           # EngineCore：持 Scheduler+Executor，add_request/step/abort
+│   ├── detokenizer.py    # 增量 detokenize + 停止串检测
+│   ├── output_processor.py  # EngineCoreOutput → RequestOutput（含 finish reason）
+│   ├── llm_engine.py     # LLMEngine：同步 facade（Processor+EngineCore+OutputProcessor）
+│   ├── async_llm.py      # AsyncLLM：异步 generator 流式逐步 yield
+│   ├── sched/            # 调度器子包（interface/output/request_queue/scheduler）
+│   ├── kv_cache/         # KV cache 子包（block_pool/kv_cache_manager/interface(Spec)）
+│   ├── executor/         # Executor 抽象（abstract+get_class / uniproc / multiproc）
+│   ├── worker.py         # Worker：单 rank 执行包装（run/exit/num_kvcache_blocks）
+│   ├── rpc.py            # ShmTransport（广播）+ ResultChannel（回传）
+│   ├── input_batch.py    # InputBatch：持久行槽位 + 增量更新 + 行回收
+│   ├── block_table.py    # BlockTable + CpuGpuBuffer：常驻块表/槽位映射
+│   ├── model_runner.py   # ModelRunner：GPU 前向 + 采样，管理 CUDA Graph
+│   ├── scheduler.py      # 垫片 → sched 子包（向后兼容）
+│   └── block_manager.py  # 垫片 → kv_cache 子包（向后兼容）
 │
-├── models/
-│   └── qwen3.py          # Qwen3 模型（Attention / MLP / Decoder / 整体）
+├── models/qwen3.py       # Qwen3 模型（Attention / MLP / Decoder / 整体）
 │
 ├── layers/               # 可复用神经网络层
-│   ├── attention.py      # PagedAttention（Triton KV写入 + FlashAttention）
+│   ├── attention/        # 注意力子系统（backend 三件套 + registry + selector + flash/sdpa + kv_ops）
+│   ├── sample/           # 结构化采样层（metadata + sampler + ops{topk_topp,penalties,logprobs}）
 │   ├── linear.py         # 张量并行线性层（Column / Row / QKV / Merged）
-│   ├── rotary_embedding.py  # RoPE 旋转位置编码
-│   ├── activation.py     # SiluAndMul（SwiGLU 激活）
-│   ├── layernorm.py      # RMSNorm（含 Fused Add-Norm）
-│   ├── embed_head.py     # VocabParallelEmbedding + ParallelLMHead
-│   └── sampler.py        # Token 采样（temperature + Gumbel-max）
+│   ├── rotary_embedding.py / activation.py / layernorm.py / embed_head.py
+│   └── sampler.py        # 垫片 → layers/sample（向后兼容）
 │
 └── utils/
-    ├── context.py        # 全局推理上下文（进程内隐式传递）
+    ├── context.py        # AttentionMetadata（显式经 forward 链透传，非全局单例）
     └── loader.py         # safetensors 权重加载（支持 packed 权重重映射）
 ```
 
@@ -54,30 +66,30 @@ nanovllm/
 ## 请求生命周期
 
 ```
-用户调用 LLM.generate(prompts, sampling_params)
+用户调用 LLM.generate(prompts, sampling_params)            （AsyncLLM.generate 为异步流式版本）
           │
           ▼
-    LLMEngine.generate()
-    ├── 1. tokenize 每个 prompt（str → token_ids）
-    ├── 2. 构造 Sequence 对象，加入 scheduler.waiting 队列
-    └── 3. 主循环 while not is_finished():
+    LLMEngine.generate()（facade，组件拆分）
+    ├── Processor.process_inputs(prompt, sp) → EngineCoreRequest（tokenize）
+    ├── EngineCore.add_request(req) → 构造 Sequence，加入 scheduler.waiting
+    ├── OutputProcessor.add_request(req)
+    └── 主循环 while EngineCore.has_unfinished_requests():
               │
               ▼
-         LLMEngine.step()
-         ├── scheduler.schedule()
-         │     → 决定本轮处理哪些 seq、做 prefill 还是 decode
-         │     → 分配/调整 KV cache block_table
-         ├── model_runner.call("run", seqs, is_prefill)
-         │     → prepare_prefill/decode（构造输入张量 + 设置 Context）
-         │     → run_model（eager forward 或 CUDA graph replay）
-         │     → sampler（rank 0 采样）
-         │     → reset_context
-         │     返回 token_ids（新采样的 token）
-         └── scheduler.postprocess(seqs, token_ids, is_prefill)
-               → block_manager.hash_blocks（注册新填满块的哈希）
-               → 更新 num_cached_tokens
-               → append_token，检查终止条件
-               → 完成的 seq 释放 KV 块，移出 running
+         EngineCore.step()  →  EngineCoreOutputs（每请求增量 token + 结束标志，不含文本）
+         ├── sched_output = scheduler.schedule()         # 统一连续批；结构化 SchedulerOutput
+         │     → prefill chunk 与 decode 混排；分配/调整 KV block_table；产 finished_seq_ids
+         ├── token_ids = executor.execute_model(seqs, sched_output.finished_seq_ids)
+         │     → (UniProc 内联 / MultiProc 隔离子进程) Worker.run → ModelRunner.run：
+         │       InputBatch.update（增量行 + 回收）→ make_inputs（行序展开 + 单次 H2D）
+         │       → run_model（eager / CUDA graph replay）→ Sampler（rank0，结构化采样）
+         │       → 行序 token 按 seq_id 映射回 seqs 顺序
+         └── scheduler.update_from_output(sched_output, token_ids)
+               → hash_blocks（注册新填满块）；更新 num_cached_tokens
+               → append_token，检查终止；完成的 seq 释放 KV 块、移出 running、记入 finished_req_ids
+         │
+         ▼
+    OutputProcessor.process_outputs(...)  → 增量 detokenize + 停止串 → RequestOutput（文本）
 ```
 
 ---
@@ -183,9 +195,10 @@ torch.cuda.reset_peak_memory_stats()
 # 构造最大批次的虚假 prefill
 seq_len = min(max_num_batched_tokens, max_model_len)    # 例：4096
 num_seqs = min(4096 // seq_len, max_num_seqs)           # 例：1
-seqs = [Sequence([0] * seq_len)]                        # token_ids 全 0
+seqs = [Sequence([0] * seq_len)]; seqs[0].num_scheduled_tokens = seq_len   # token_ids 全 0
 
-self.run(seqs, True)   # 触发完整 forward，激活峰值被 CUDA 追踪
+self.run(seqs)             # 触发完整 forward，激活峰值被 CUDA 追踪
+self.input_batch.clear()   # 清空 warmup 占用的持久行，真正推理从空批开始
 torch.cuda.empty_cache()   # 清理激活张量，KV cache 尚未分配
 ```
 
@@ -209,6 +222,9 @@ block_bytes = 2 * num_layers * block_size * num_kv_heads * head_dim * dtype.item
 
 num_kvcache_blocks = available // block_bytes
 ```
+
+> 对齐 V1 后，"单块字节数 / 显存→块数"的计算封装进 `kv_cache/interface.py::FullAttentionSpec`
+> （`page_size_bytes` / `num_blocks_for_memory`），`allocate_kv_cache` 调用它，数值与上式逐位等价。
 
 **实测（Qwen3-1.7B，RTX 3060 Ti 8GB，gpu_memory_utilization=0.9）：**
 
@@ -277,82 +293,66 @@ Qwen3ForCausalLM
 
 ---
 
-## 多进程架构（张量并行）
+## 执行器与多进程架构（Executor 抽象）
 
-### 进程拓扑
+EngineCore 不直接管理进程/TP，而是依赖 **Executor 抽象**（`engine/executor/`）。`Executor.get_class(config)`
+按 `distributed_executor_backend` 选择后端（None 时按 TP 自动）：
 
-```
-主进程 (rank 0, GPU 0)
-  ├── LLMEngine（Python 调度主循环）
-  ├── Scheduler（CPU 端请求管理）
-  └── ModelRunner(rank=0)
-        ├── Qwen3ForCausalLM（GPU 0 上模型参数的一部分）
-        ├── KV Cache 切片（GPU 0 上 num_kv_heads/tp 个 head）
-        ├── Sampler（只有 rank 0 执行采样）
-        └── SharedMemory "nanovllm"（1 MB，写端）
-              ├── Event[0] ─── 通知 ──► 子进程 rank=1 (GPU 1)
-              └── Event[1] ─── 通知 ──► 子进程 rank=2 (GPU 2)
+| 后端 | 触发条件 | 布局 |
+|---|---|---|
+| `UniProcExecutor` | TP=1 且未显式指定（默认） | 单 Worker **内联**在引擎进程，`execute_model` 本地直调，无 RPC/无 barrier |
+| `MultiProcExecutor` | TP>1，或显式 `distributed_executor_backend="mp"` | **所有 rank（含 rank0）皆 spawn 子进程**；引擎进程不内联 Worker、不入 NCCL 组 |
 
-子进程 rank=i (GPU i)
-  └── ModelRunner(rank=i)
-        ├── Qwen3ForCausalLM（GPU i 上模型参数的一部分）
-        ├── KV Cache 切片（GPU i 上 num_kv_heads/tp 个 head）
-        └── SharedMemory "nanovllm"（读端）
-              ↑ event.wait() 阻塞等待 rank 0 写入
-```
-
-### 初始化序列
+### 进程拓扑（MultiProcExecutor，完全隔离）
 
 ```
-所有进程并发执行（LLMEngine 通过 multiprocessing.Process 启动子进程）：
-
-1. dist.init_process_group("nccl", "tcp://localhost:2333", ...)
-   — 所有 rank 阻塞在此，直到 tp_size 个进程全部连接
-   — NCCL 在此时协商通信拓扑（NVLink、PCIe、IB 等）
-
-2. torch.cuda.set_device(rank)   — 绑定 CUDA 设备
-
-3. torch.set_default_device("cuda")  — 后续所有 torch.empty/zeros → GPU
-   torch.set_default_dtype(hf_config.dtype)  — bfloat16
-
-4. 构建 Qwen3ForCausalLM（在 GPU 上直接分配参数）
-
-5. load_model(...)  — 从 safetensors 加载权重（TP 切分后，每 rank 只加载自己的份额）
-
-6. warmup_model() → allocate_kv_cache() → capture_cudagraph()
-
-7. rank 0: 创建 SharedMemory，dist.barrier()
-   rank i: dist.barrier()，连接 SharedMemory，进入 loop() — 永久阻塞
+引擎进程（纯 CPU 协调，无 Worker / 无 NCCL）
+  ├── LLMEngine / EngineCore / Scheduler
+  └── MultiProcExecutor
+        ├── ShmTransport "nanovllm"（广播：executor → 所有 worker，N 个 Event）
+        └── ResultChannel "nanovllm_result"（回传：输出 rank0 → executor）
+              ▲ 取回 token_ids / num_kvcache_blocks
+   spawn │   ┌───────────────────────────────────────────────┐
+         ▼   ▼                                               │
+  worker 子进程 rank=0..N-1（各持 GPU i 的模型切片 + KV cache 切片）
+        └── Worker → ModelRunner：NCCL init → warmup → allocate → cudagraph → 收发循环
+              · 收 broadcast(method,seqs,finished) → execute → (rank0) 回传 ResultChannel
+              · NCCL all_reduce 在模型 forward 内做张量同步（worker 之间）
 ```
 
-### SharedMemory 通信协议（详细）
+> 对齐前 rank0 内联在引擎进程、仅 rank1..N 为子进程；**K 轮进程隔离**后所有 rank 均隔离，
+> 引擎进程不再持模型/不入 NCCL，块数经 `collective_rpc("num_kvcache_blocks")` 回传。
+> 默认 TP=1 仍走 UniProc 内联（零额外开销）。详见 `arch_worker_isolation/`。
+
+### 初始化序列（MultiProc）
 
 ```
-发送方（rank 0, write_shm）：
-  data = pickle.dumps([method_name, arg1, arg2, ...])
-  n = len(data)                           # 数据字节长度
-  shm.buf[0:4] = n.to_bytes(4, "little") # 头 4 字节写长度
-  shm.buf[4:n+4] = data                   # 后续写 pickle 数据
-  for event in self.event:
-      event.set()  # 同时通知所有 rank（OS 原语，跨进程）
+1. executor 先建两条通道（ShmTransport + ResultChannel），子进程一启动即可打开
+2. spawn rank0..N-1：各自 Worker(config, rank)
+     · dist.init_process_group("nccl", "tcp://localhost:2333", world_size=N, rank)
+     · set_device(rank) → 建模 → load_model（TP 切分）→ warmup → allocate_kv_cache → capture_cudagraph
+     · 进入收发循环
+3. executor: collective_rpc("num_kvcache_blocks") → 阻塞等 rank0 回传 → 填 config.num_kvcache_blocks
+   （EngineCore 随后据此构建 Scheduler 的 KVCacheManager）
+```
 
-接收方（rank i, read_shm）：
-  self.event.wait()     # 阻塞，CPU 零消耗等待
-  n = int.from_bytes(shm.buf[0:4], "little")
-  method_name, *args = pickle.loads(shm.buf[4:n+4])
-  self.event.clear()    # 复位 event，等待下一次通知
-  return method_name, args
+### RPC 通信协议（ShmTransport + ResultChannel）
 
-loop()：
-  while True:
-      method_name, args = read_shm()
-      call(method_name, *args)    # 执行方法（run/allocate_kv_cache 等）
-      if method_name == "exit": break
+```
+广播（executor → workers，ShmTransport）：
+  encode(method, seqs, finished) = msgpack((method, [s.__getstate__()...], finished_list))
+  shm.buf[0:4]=len; shm.buf[4:]=data; for e in worker_events: e.set()
+  worker: event.wait() → 读 shm → decode → execute → event.clear()
 
-重要约束：
-  - 1 MB SharedMemory 限制 args 的 pickle 大小
-  - seqs 对象不走 SharedMemory（太大），而是 Sequence 内部有 __getstate__/__setstate__ 优化
-  - 实际 run() 的 seqs 参数需能 pickle：Sequence 使用 __reduce__ 只传 token_ids 和元数据
+回传（输出 rank0 → executor，ResultChannel）：
+  worker: result.send(token_ids)  → 写 result_shm + result_event.set()
+  executor: result.recv()         → wait → 读 → clear
+
+约束（与 vLLM 多槽 MessageQueue 的差异）：
+  - msgpack 替换裸 pickle：载荷为 Sequence.__getstate__ 的轻量元组（int/list[int]/采样标量）
+  - 单槽 shm：靠 execute_model 同步 + "run" 内 NCCL 集体保证时序安全
+  - 进程隔离下采样发生在 rank0 子进程、吃反序列化 seq，故采样标量随 __getstate__ 传输；
+    但 decode 仅传 last_token，惩罚类采样在隔离模式不可用（详见 arch_worker_isolation/design.md）
 ```
 
 ### NCCL 通信时机
@@ -378,20 +378,26 @@ ParallelLMHead.forward():
 
 ---
 
-## LLMEngine 主循环
+## EngineCore 主循环
 
 ```python
-def step(self) -> bool:
-    seqs, is_prefill = self.scheduler.schedule()
-    token_ids = self.model_runner.call("run", seqs, is_prefill)
-    self.scheduler.postprocess(seqs, token_ids, is_prefill)
-    return self.scheduler.is_finished()
+def step(self) -> EngineCoreOutputs:
+    sched_output = self.scheduler.schedule()                      # 统一连续批 → 结构化输出
+    if sched_output.is_empty:
+        return EngineCoreOutputs()
+    seqs = sched_output.scheduled_seqs
+    token_ids = self.executor.execute_model(seqs, sched_output.finished_seq_ids)
+    self.scheduler.update_from_output(sched_output, token_ids)
+    return EngineCoreOutputs(outputs=[...每请求增量 token + finish_reason...])
 ```
 
-`call("run", ...)` 的语义：
-- rank 0：先 `write_shm("run", ...)` 通知子进程，再自己执行 `run(seqs, is_prefill)`
-- rank i：在 `loop()` 中读取到 "run" 指令后执行 `run(seqs, is_prefill)`（GPU 同步通过 NCCL）
-- 子进程 `run()` 的 `seqs` 参数通过 pickle/SharedMemory 传递，因此 Sequence 必须可序列化
+`executor.execute_model(seqs, finished_seq_ids)` 的语义按后端不同：
+- **UniProc（默认）**：本进程 `Worker.execute("run", seqs, finished)` 直调 ModelRunner.run。
+- **MultiProc（隔离）**：`broadcast("run", seqs, finished)` 给所有 worker 子进程 → 各 rank 执行
+  （NCCL 同步张量）→ 输出 rank0 经 ResultChannel 回传 token_ids。
+
+`seqs` 经 `Sequence.__getstate__/__setstate__` 序列化（msgpack）；finished_seq_ids 用于各 rank 的
+InputBatch 回收已结束/被抢占的行槽位。
 
 ---
 
@@ -399,23 +405,26 @@ def step(self) -> bool:
 
 ```
 LLM
- └── LLMEngine
-       ├── Scheduler
-       │     └── BlockManager          ← 只管逻辑（block_table、hash）
-       │           └── (Block)
-       └── ModelRunner (rank 0)
-             ├── Qwen3ForCausalLM
-             │     └── Qwen3DecoderLayer × N
-             │           ├── Attention  ← 直接持有 kv_cache 切片
-             │           │     └── store_kvcache (Triton)
-             │           │     └── flash_attn_{varlen,with_kvcache}
-             │           └── Qwen3MLP
-             ├── Sampler
-             ├── Context (全局单例)     ← prepare_*/run 之间隐式传递
-             └── [SharedMemory → ModelRunner rank i × (tp-1)]
+ └── LLMEngine（facade）
+       ├── Processor                      ← tokenize → EngineCoreRequest
+       ├── EngineCore
+       │     ├── Scheduler (sched/)
+       │     │     └── KVCacheManager (kv_cache/) → BlockPool   ← 只管逻辑（block_table/hash/引用计数）
+       │     └── Executor (executor/)      ← UniProc 内联 / MultiProc 隔离子进程
+       │           └── Worker → ModelRunner
+       │                 ├── Qwen3ForCausalLM
+       │                 │     └── Qwen3DecoderLayer × N
+       │                 │           ├── Attention  ← 绑定后端 impl，持有 kv_cache 切片
+       │                 │           │     └── store_kvcache (Triton) / flash_attn_varlen / SDPA
+       │                 │           └── Qwen3MLP
+       │                 ├── InputBatch (持久行 + 增量块表 BlockTable)
+       │                 └── Sampler (sample/)  ← rank0 结构化采样
+       └── OutputProcessor                 ← 增量 detokenize + 停止串 → RequestOutput
 ```
 
 **关键解耦点：**
-- `BlockManager` 与 GPU 完全解耦，只维护 `block_table` 的整数映射
-- `Context` 解耦 `ModelRunner` 与 `Attention` 层的接口（不需要修改 forward 签名）
-- `Attention` 层只知道"从 Context 取 slot_mapping/block_tables"，不知道调度策略
+- `KVCacheManager`/`BlockPool` 与 GPU 完全解耦，只维护 `block_table` 的整数映射与前缀缓存哈希。
+- `AttentionMetadata`（`utils/context.py`）**显式经 forward 链透传**（非全局单例），解耦 ModelRunner
+  与 Attention 层；后端在 `Attention.__init__` 由 `get_attn_backend(head_size, dtype, device)` 绑定。
+- `Executor` 把 TP 规模/进程隔离对 EngineCore 隐藏，EngineCore 只依赖 `execute_model`。
+- `InputBatch` 跨步常驻，把"每步重建输入 + 整表 H2D"降为"增量行 + 单次切片 H2D"。

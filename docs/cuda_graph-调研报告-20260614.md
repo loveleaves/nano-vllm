@@ -266,4 +266,4 @@ PIECEWISE 依赖 Inductor 编译，并叠加 PassConfig 里的融合 pass（`com
 - nano-vllm 源码：`nanovllm/engine/model_runner.py`（`capture_cudagraph`/`run_model`/`run`）、`nanovllm/utils/context.py`、`nanovllm/layers/attention.py`（commit `f8d495d`，phase4 分支）
 - vLLM 源码（本地 checkout `/home/cb/work/vllm/vllm`）：`vllm/compilation/cuda_graph.py`、`vllm/config/compilation.py`、`vllm/compilation/{backends,piecewise_backend}.py`、`vllm/forward_context.py`
 - CUDA Graph 背景：PyTorch `torch.cuda.graph` / CUDA Graphs 官方文档
-- 相关文档：`docs/detailed_design.md`、`docs/tensor_parallelism-调研报告-20260614.md`、`docs/prefix_caching-调研报告-20260614.md`、`docs/chunked_prefill-调研报告-20260614.md`
+- 相关文档：`docs/02_core_concepts.md`、`docs/tensor_parallelism-调研报告-20260614.md`、`docs/prefix_caching-调研报告-20260614.md`、`docs/chunked_prefill-调研报告-20260614.md`

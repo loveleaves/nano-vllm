@@ -46,10 +46,17 @@ class EngineCore:
             max_num_batched_tokens=config.max_num_batched_tokens,
             eos=config.eos,
             policy=SchedulingPolicy(config.scheduling_policy),
+            num_swap_blocks=config.num_swap_blocks,
         )
         # request_id ↔ Sequence，供 abort / 结束清理
         self.requests: dict[str, Sequence] = {}
+        # 最近一步的调度统计（可观测性；get_stats 取用）
+        self.scheduler_stats = None
         atexit.register(self.exit)
+
+    def get_stats(self):
+        """返回最近一步的 SchedulerStats（None 表示尚未 step）。"""
+        return self.scheduler_stats
 
     # ── 生命周期 ──────────────────────────────────────────────────────────────
     def exit(self):
@@ -79,17 +86,24 @@ class EngineCore:
     def step(self) -> EngineCoreOutputs:
         """调度一批 → 执行 → 后处理 → 收集每请求增量。"""
         sched_output = self.scheduler.schedule()
+        self.scheduler_stats = self.scheduler.make_stats(
+            sched_output.total_num_scheduled_tokens)
         if sched_output.is_empty:
             return EngineCoreOutputs()
 
         seqs = sched_output.scheduled_seqs
+        # 抢占换出 / 换回的 KV 块搬运，须在 execute_model 之前（swap_out 读旧 KV）
+        if sched_output.blocks_to_swap_in or sched_output.blocks_to_swap_out:
+            self.executor.execute_swap(
+                sched_output.blocks_to_swap_in, sched_output.blocks_to_swap_out)
         # 记录每个 seq 本步前已产出的 completion 数，用于判定是否真的吐了新 token
         prev_completion = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
-        token_ids = self.executor.execute_model(seqs, sched_output.finished_seq_ids)
+        token_ids, step_logprobs = self.executor.execute_model(
+            seqs, sched_output.finished_seq_ids)
         self.scheduler.update_from_output(sched_output, token_ids)
 
         outputs: list[EngineCoreOutput] = []
-        for seq in seqs:
+        for i, seq in enumerate(seqs):
             # prefill chunk 未覆盖完整 prompt 的步不产 token（postprocess 已跳过追加）
             if seq.num_completion_tokens == prev_completion[seq.seq_id]:
                 continue
@@ -105,6 +119,7 @@ class EngineCore:
                 new_token_ids=[seq.last_token],
                 finished=finished,
                 finish_reason=finish_reason,
+                logprobs=step_logprobs[i] if step_logprobs is not None else None,
             ))
 
         # 吞吐提示：任一 seq 调度 >1 token 记为含 prefill，否则纯 decode

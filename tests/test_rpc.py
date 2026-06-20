@@ -101,6 +101,24 @@ class TestResultChannel:
             chan.unlink()
 
     @pytest.mark.unit
+    def test_recv_alive_check_raises_instead_of_blocking(self):
+        # event 永不被 set + alive_check 抛错 → recv 抛错而非永久阻塞
+        name = f"nanovllm_test_{os.getpid()}_c"
+        event = mp.get_context("spawn").Event()
+        chan = ResultChannel(event, create=True, name=name)
+        calls = {"n": 0}
+        def alive_check():
+            calls["n"] += 1
+            raise RuntimeError("worker died")
+        try:
+            with pytest.raises(RuntimeError, match="worker died"):
+                chan.recv(alive_check=alive_check, poll=0.01)
+            assert calls["n"] >= 1
+        finally:
+            chan.close()
+            chan.unlink()
+
+    @pytest.mark.unit
     def test_event_cleared_after_recv(self):
         name = f"nanovllm_test_{os.getpid()}_b"
         event = mp.get_context("spawn").Event()

@@ -27,6 +27,9 @@ class SchedulerOutput:
     total_num_scheduled_tokens: int = 0
     preempted_seq_ids: set[int] = field(default_factory=set)
     finished_seq_ids: set[int] = field(default_factory=set)
+    # 本步需执行的 KV 块搬运（gpu_block_id, swap_slot）：抢占→swap_out，恢复→swap_in
+    blocks_to_swap_out: list[tuple[int, int]] = field(default_factory=list)
+    blocks_to_swap_in: list[tuple[int, int]] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:

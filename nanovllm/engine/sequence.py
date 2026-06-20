@@ -57,7 +57,10 @@ class Sequence:
         self.presence_penalty = sampling_params.presence_penalty
         self.frequency_penalty = sampling_params.frequency_penalty
         self.repetition_penalty = sampling_params.repetition_penalty
+        self.min_p = sampling_params.min_p
         self.logprobs = sampling_params.logprobs
+        self.seed = sampling_params.seed
+        self.bad_words_token_ids = sampling_params.bad_words_token_ids
 
     def __len__(self) -> int:
         return self.num_tokens
@@ -128,7 +131,8 @@ class Sequence:
                 self.block_table, last_state,
                 self.temperature, self.top_p, self.top_k,
                 self.presence_penalty, self.frequency_penalty,
-                self.repetition_penalty, self.logprobs)
+                self.repetition_penalty, self.min_p, self.logprobs,
+                self.seed, self.bad_words_token_ids)
 
     def __setstate__(self, state):
         (self.seq_id, self.num_tokens, self.num_prompt_tokens,
@@ -136,7 +140,8 @@ class Sequence:
          self.block_table, last_state,
          self.temperature, self.top_p, self.top_k,
          self.presence_penalty, self.frequency_penalty,
-         self.repetition_penalty, self.logprobs) = state
+         self.repetition_penalty, self.min_p, self.logprobs,
+         self.seed, self.bad_words_token_ids) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

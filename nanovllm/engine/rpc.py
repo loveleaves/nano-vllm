@@ -103,9 +103,17 @@ class ResultChannel:
         self.shm.buf[4:n + 4] = data
         self.event.set()
 
-    def recv(self):
-        """executor：等待并读取输出 rank 的结果。"""
-        self.event.wait()
+    def recv(self, alive_check=None, poll: float = 1.0):
+        """executor：等待并读取输出 rank 的结果。
+
+        alive_check 非空时改为轮询等待，每 poll 秒调用一次 alive_check()——若某 worker
+        子进程已死，alive_check 应抛异常，避免 event 永远不被 set 导致永久阻塞。
+        """
+        if alive_check is None:
+            self.event.wait()
+        else:
+            while not self.event.wait(poll):
+                alive_check()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         obj = msgspec.msgpack.decode(bytes(self.shm.buf[4:n + 4]))
         self.event.clear()

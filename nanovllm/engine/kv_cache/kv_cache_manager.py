@@ -8,15 +8,21 @@ KV cache 管理器（对齐 vLLM V1 `v1/core/kv_cache_manager.py::KVCacheManager
 > KVCacheCoordinator / 多组（hybrid：sliding window / Mamba / MLA）编排。详见
 > docs/arch_kvcache/design.md。
 """
+from collections import deque
+
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.kv_cache.block_pool import BlockPool
 
 
 class KVCacheManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, num_swap_blocks: int = 0):
         self.block_size = block_size
         self.block_pool = BlockPool(num_blocks, block_size)
+        # CPU swap 区：空闲槽位 + 已换出序列的槽位映射（seq_id → 逻辑块序的 swap_slot 列表）
+        self.num_swap_blocks = num_swap_blocks
+        self.free_swap_slots: deque[int] = deque(range(num_swap_blocks))
+        self.swapped_slots: dict[int, list[int]] = {}
 
     # ── 向后兼容：旧 BlockManager 直接访问的属性/类方法 ───────────────────────────
     @property
@@ -96,6 +102,36 @@ class KVCacheManager:
             self.block_pool.deref_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+
+    # ── swap（抢占换出/换入，对齐 V1 swap_out/swap_in）────────────────────────
+    def can_swap_out(self, seq: Sequence) -> bool:
+        return len(self.free_swap_slots) >= seq.num_blocks
+
+    def swap_out(self, seq: Sequence) -> list[tuple[int, int]]:
+        """把 seq 全部逻辑块搬到 CPU swap 区：分配 swap_slots、释放 GPU 块（**保留**
+        num_cached_tokens，故恢复后续 decode 而非重算）。返回 [(gpu_block_id, swap_slot)]
+        （按逻辑块序），供 ModelRunner 做 D2H 拷贝。"""
+        block_ids = list(seq.block_table)
+        slots = [self.free_swap_slots.popleft() for _ in block_ids]
+        self.swapped_slots[seq.seq_id] = slots
+        mapping = list(zip(block_ids, slots))
+        for block_id in reversed(block_ids):
+            self.block_pool.deref_block(block_id)
+        seq.block_table.clear()         # GPU 块已释放；num_cached_tokens 不动
+        return mapping
+
+    def can_swap_in(self, seq: Sequence) -> bool:
+        return self.block_pool.get_num_free_blocks() >= seq.num_blocks
+
+    def swap_in(self, seq: Sequence) -> list[tuple[int, int]]:
+        """为 seq 重新分配 GPU 块并从 CPU swap 区恢复：返回 [(gpu_block_id, swap_slot)]
+        供 ModelRunner 做 H2D 拷贝；归还 swap_slots，恢复 seq.block_table。"""
+        slots = self.swapped_slots.pop(seq.seq_id)
+        block_ids = [self.block_pool.get_new_block() for _ in slots]
+        seq.block_table = block_ids
+        for s in slots:
+            self.free_swap_slots.append(s)
+        return list(zip(block_ids, slots))
 
     def can_append(self, seq: Sequence) -> bool:
         """decode 步是否有足够块追加（仅当 len%block_size==1 时需要新块）。"""

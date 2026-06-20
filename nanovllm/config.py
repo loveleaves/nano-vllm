@@ -34,6 +34,7 @@ class Config:
     enforce_eager: bool = False
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    num_swap_blocks: int = 0   # CPU swap 区块数（>0 时抢占走 swap 而非 recompute；仅 TP=1 内联支持）
     scheduling_policy: str = "fcfs"
     hf_config: object = field(default=None, repr=False)
     eos: int = -1

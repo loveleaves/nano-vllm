@@ -11,7 +11,7 @@ from nanovllm.layers.attention import Attention
 from nanovllm.layers.sample import Sampler, SamplingMetadata
 from nanovllm.utils.context import AttentionMetadata
 from nanovllm.utils.loader import load_model
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import resolve_model_cls
 
 
 class ModelRunner:
@@ -57,7 +57,11 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
 
-        self.model = Qwen3ForCausalLM(hf_config)
+        # 动态解析架构 → 模型类（惰性导入）：从 HF config 的 architectures 字段查注册表，
+        # 命中后才 import 对应模块，避免主进程过早初始化 CUDA / 导入全部模型。
+        architectures = getattr(hf_config, "architectures", None) or ["Qwen3ForCausalLM"]
+        model_cls, _arch = resolve_model_cls(architectures)
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         # 按请求 seed 持久化的随机数生成器（seq_id → Generator），跨步续流

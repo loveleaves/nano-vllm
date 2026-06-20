@@ -78,7 +78,7 @@ class TestSchedulerSwap:
         sched = Scheduler(num_kvcache_blocks=10, block_size=4, max_num_seqs=8,
                           max_num_batched_tokens=16, eos=-1, num_swap_blocks=8)
         seq = _seq(4)
-        sched.add(seq)
+        sched.add_request(seq)
         out = sched.schedule()
         sched.update_from_output(out, [1])             # decode 一步 → len 5
         assert seq.status == SequenceStatus.RUNNING
@@ -97,7 +97,7 @@ class TestSchedulerSwap:
         sched = Scheduler(num_kvcache_blocks=10, block_size=4, max_num_seqs=8,
                           max_num_batched_tokens=16, eos=-1, num_swap_blocks=8)
         seq = _seq(4)
-        sched.add(seq)
+        sched.add_request(seq)
         out = sched.schedule()
         sched.update_from_output(out, [1])
         sched.preempt(seq, [])                          # 手动换出
@@ -117,7 +117,7 @@ class TestSchedulerSwap:
         sched = Scheduler(num_kvcache_blocks=10, block_size=4, max_num_seqs=8,
                           max_num_batched_tokens=16, eos=-1, num_swap_blocks=1)
         seq = _seq(8)                                   # 需 2 槽，swap 只 1
-        sched.add(seq)
+        sched.add_request(seq)
         out = sched.schedule()
         sched.update_from_output(out, [1])
 
@@ -135,7 +135,7 @@ class TestSchedulerSwap:
         sched = Scheduler(num_kvcache_blocks=10, block_size=4, max_num_seqs=8,
                           max_num_batched_tokens=16, eos=-1, num_swap_blocks=8)
         seq = _seq(4)
-        sched.add(seq)
+        sched.add_request(seq)
         out = sched.schedule()
         sched.update_from_output(out, [1])
         sched.running.remove(seq)                       # schedule() 先从 running 弹出受害者
@@ -148,7 +148,7 @@ class TestSchedulerSwap:
         sched = Scheduler(num_kvcache_blocks=10, block_size=4, max_num_seqs=8,
                           max_num_batched_tokens=16, eos=-1, num_swap_blocks=8)
         seq = _seq(8)
-        sched.add(seq)
+        sched.add_request(seq)
         out = sched.schedule()
         sched.update_from_output(out, [1])
         sched.preempt(seq, [])

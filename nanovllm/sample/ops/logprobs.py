@@ -3,7 +3,7 @@ logprobs 计算与收集（对齐 vLLM V1 `v1/sample/ops/logprobs.py` + Sampler.
 """
 import torch
 
-from nanovllm.layers.sample.outputs import LogprobsTensors
+from nanovllm.sample.outputs import LogprobsTensors
 
 
 def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:

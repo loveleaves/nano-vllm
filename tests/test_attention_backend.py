@@ -5,12 +5,12 @@ import os
 import pytest
 import torch
 
-from nanovllm.layers.attention import (
+from nanovllm.attention import (
     Attention, get_attn_backend, AttentionBackend, AttentionImpl,
     AttentionMetadataBuilder, FlashAttentionBackend, TorchSDPABackend,
     AttentionBackendEnum, register_backend,
 )
-from nanovllm.layers.attention.common import CommonAttentionMetadata
+from nanovllm.attention.common import CommonAttentionMetadata
 
 
 class TestBackendTriad:
@@ -41,23 +41,23 @@ class TestSelector:
     @pytest.mark.unit
     def test_cpu_selects_sdpa(self):
         os.environ.pop("NANOVLLM_ATTN_BACKEND", None)
-        assert get_attn_backend(is_cuda=False) is TorchSDPABackend
+        assert get_attn_backend(device_type="cpu") is TorchSDPABackend
 
     @pytest.mark.unit
     def test_cuda_with_flash_selects_flash(self):
         os.environ.pop("NANOVLLM_ATTN_BACKEND", None)
         # flash_attn 已安装的环境下，cuda → flash
-        from nanovllm.layers.attention.flash_attn import HAS_FLASH_ATTN
+        from nanovllm.attention.flash_attn import HAS_FLASH_ATTN
         expected = FlashAttentionBackend if HAS_FLASH_ATTN else TorchSDPABackend
-        assert get_attn_backend(is_cuda=True) is expected
+        assert get_attn_backend(device_type="cuda") is expected
 
     @pytest.mark.unit
     def test_env_override_forces_backend(self):
         try:
             os.environ["NANOVLLM_ATTN_BACKEND"] = "torch_sdpa"
-            assert get_attn_backend(is_cuda=True) is TorchSDPABackend
+            assert get_attn_backend(device_type="cuda") is TorchSDPABackend
             os.environ["NANOVLLM_ATTN_BACKEND"] = "flash_attn"
-            assert get_attn_backend(is_cuda=False) is FlashAttentionBackend
+            assert get_attn_backend(device_type="cpu") is FlashAttentionBackend
         finally:
             os.environ.pop("NANOVLLM_ATTN_BACKEND", None)
 
@@ -99,7 +99,7 @@ class TestCapabilitySelection:
     @pytest.mark.unit
     def test_cuda_fp32_falls_back_to_sdpa(self):
         os.environ.pop("NANOVLLM_ATTN_BACKEND", None)
-        from nanovllm.layers.attention.flash_attn import HAS_FLASH_ATTN
+        from nanovllm.attention.flash_attn import HAS_FLASH_ATTN
         # cuda + fp32（flash 仅 fp16/bf16）→ 回退 SDPA
         assert get_attn_backend(head_size=128, dtype=torch.float32,
                                 device_type="cuda") is TorchSDPABackend
@@ -129,7 +129,7 @@ class TestRegistry:
         member = AttentionBackendEnum.FLASH_ATTN
         try:
             register_backend(
-                member, "nanovllm.layers.attention.torch_sdpa.TorchSDPABackend")
+                member, "nanovllm.attention.torch_sdpa.TorchSDPABackend")
             assert member.is_overridden()
             assert member.get_class() is TorchSDPABackend   # 覆盖后解析到替身
         finally:
@@ -144,7 +144,7 @@ class TestAttentionLayerBinding:
     def test_layer_binds_backend_at_init(self):
         # CPU 默认设备 → SDPA impl
         attn = Attention(num_heads=4, head_dim=8, scale=8 ** -0.5, num_kv_heads=2)
-        from nanovllm.layers.attention.torch_sdpa import TorchSDPAImpl
+        from nanovllm.attention.torch_sdpa import TorchSDPAImpl
         assert isinstance(attn.impl, TorchSDPAImpl)
 
     @pytest.mark.unit

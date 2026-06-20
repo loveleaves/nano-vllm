@@ -44,10 +44,6 @@ class KVCacheBlock:
         self.token_ids = []
 
 
-# 向后兼容别名（旧代码/测试用 Block）
-Block = KVCacheBlock
-
-
 class BlockPool:
     """
     物理块池：分页 KV cache 的块级原语 + 前缀缓存哈希表。

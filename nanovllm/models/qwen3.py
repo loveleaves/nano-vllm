@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.attention import Attention
+from nanovllm.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import (
     QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear,

@@ -11,7 +11,7 @@ nano 仅 FlashAttn + SDPA 两后端，能力查询精简为最小集，接口为
 from abc import ABC, abstractmethod
 import torch
 
-from nanovllm.layers.attention.common import CommonAttentionMetadata
+from nanovllm.attention.common import CommonAttentionMetadata
 
 
 class AttentionBackend(ABC):

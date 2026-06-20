@@ -22,5 +22,14 @@ class UniProcExecutor(Executor):
         if blocks_to_swap_in or blocks_to_swap_out:
             self.worker.model_runner.execute_swap(blocks_to_swap_in, blocks_to_swap_out)
 
+    def execute_model_async(self, seqs, finished_seq_ids=None) -> None:
+        self.worker.model_runner.execute_model_async(seqs, finished_seq_ids)
+
+    def resolve_inflight(self):
+        return self.worker.model_runner.resolve_inflight()
+
+    def promote_async(self) -> None:
+        self.worker.model_runner.promote_async()
+
     def shutdown(self) -> None:
         self.worker.execute("exit")

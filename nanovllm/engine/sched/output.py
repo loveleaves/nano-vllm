@@ -30,6 +30,8 @@ class SchedulerOutput:
     # 本步需执行的 KV 块搬运（gpu_block_id, swap_slot）：抢占→swap_out，恢复→swap_in
     blocks_to_swap_out: list[tuple[int, int]] = field(default_factory=list)
     blocks_to_swap_in: list[tuple[int, int]] = field(default_factory=list)
+    # 异步调度：本步"产出 token"（非 partial prefill chunk）的 seq_id，用于结果回填/EOS 判定
+    produced_token_seq_ids: set[int] = field(default_factory=set)
 
     @property
     def is_empty(self) -> bool:

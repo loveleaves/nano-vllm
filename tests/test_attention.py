@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from nanovllm.utils.context import AttentionMetadata
-from nanovllm.layers.attention import Attention
+from nanovllm.attention import Attention
 
 
 def _prefill_md(cu_q):

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from nanovllm.utils.context import AttentionMetadata
-from nanovllm.layers.embed_head import VocabEmbedding, LMHead
+from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 def _md(cu_q):
@@ -21,14 +21,14 @@ class TestVocabEmbedding:
 
     @pytest.mark.unit
     def test_output_shape(self):
-        emb = VocabEmbedding(100, 16)
+        emb = VocabParallelEmbedding(100, 16)
         x = torch.randint(0, 100, (5,))
         y = emb(x)
         assert y.shape == (5, 16)
 
     @pytest.mark.unit
     def test_equivalence_to_nn_embedding(self):
-        emb = VocabEmbedding(64, 8)
+        emb = VocabParallelEmbedding(64, 8)
         nn.init.normal_(emb.weight)
         ref = nn.Embedding(64, 8)
         ref.weight.data.copy_(emb.weight.data)
@@ -37,7 +37,7 @@ class TestVocabEmbedding:
 
     @pytest.mark.unit
     def test_weight_loader_copies_correctly(self):
-        emb = VocabEmbedding(32, 8)
+        emb = VocabParallelEmbedding(32, 8)
         w = torch.randn(32, 8)
         emb.weight_loader(emb.weight, w)
         assert torch.allclose(emb.weight.data, w)
@@ -48,7 +48,7 @@ class TestLMHead:
     @pytest.mark.unit
     def test_no_metadata_full_output(self):
         # attn_md=None → 不做选取，输出全部行（等价旧 decode 全输出）
-        head = LMHead(50, 16)
+        head = ParallelLMHead(50, 16)
         nn.init.normal_(head.weight)
         y = head(torch.randn(7, 16), None)
         assert y.shape == (7, 50)
@@ -56,7 +56,7 @@ class TestLMHead:
     @pytest.mark.unit
     def test_decode_metadata_is_identity(self):
         # decode：query_start_loc=[0,1,2] → last_indices=[0,1] 选取退化为恒等
-        head = LMHead(50, 16)
+        head = ParallelLMHead(50, 16)
         nn.init.normal_(head.weight)
         x = torch.randn(2, 16)
         y = head(x, _md([0, 1, 2]))
@@ -65,14 +65,14 @@ class TestLMHead:
 
     @pytest.mark.unit
     def test_prefill_mode_extracts_last_tokens(self):
-        head = LMHead(50, 16)
+        head = ParallelLMHead(50, 16)
         nn.init.normal_(head.weight)
         y = head(torch.randn(7, 16), _md([0, 3, 7]))
         assert y.shape == (2, 50)   # 2 个 seq → 各取最后 1 个 token
 
     @pytest.mark.unit
     def test_prefill_correct_last_token_indices(self):
-        head = LMHead(10, 4)
+        head = ParallelLMHead(10, 4)
         nn.init.normal_(head.weight)
         x = torch.randn(5, 4)
         out = head(x, _md([0, 3, 5]))

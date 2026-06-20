@@ -15,7 +15,7 @@
 - `seqs, ns = sched.schedule()` → `out = sched.schedule()`，读 `out.scheduled_seqs` /
   `out.num_scheduled_tokens`（测试用 `_sched()` 辅助一次性解包）。
 - `sched.postprocess(seqs, toks, ns)` → `sched.update_from_output(out, toks)`。
-- `sched.add` 别名保留；`sched.waiting` 现为 `RequestQueue`，断言改用
+- 调度入队用 `sched.add_request`（旧 `sched.add` 别名已移除）；`sched.waiting` 现为 `RequestQueue`，断言改用
   `waiting.peek_request()` / `seq in waiting` / `len(waiting)`（FCFS 仍是 deque，索引可用）。
 
 ## 回归

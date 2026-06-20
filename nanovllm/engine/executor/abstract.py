@@ -55,6 +55,19 @@ class Executor(ABC):
             raise NotImplementedError(
                 "swap 抢占仅 UniProc（TP=1 内联）支持；MultiProc 需扩展 RPC 载荷")
 
+    # ── 异步调度（仅 UniProc 内联实现；采样 token 留 GPU 跨步前向）────────────────
+    def execute_model_async(self, seqs, finished_seq_ids=None) -> None:
+        """非阻塞下发一步推理（不做 D2H 同步），结果暂存待 resolve_inflight 回收。"""
+        raise NotImplementedError("async_scheduling 仅 UniProc 支持")
+
+    def resolve_inflight(self):
+        """D2H 取回上一步在飞结果：返回 (tok_by_id, lp_by_id)。"""
+        raise NotImplementedError("async_scheduling 仅 UniProc 支持")
+
+    def promote_async(self) -> None:
+        """把本步采样张量提升为下一步的前向源。"""
+        raise NotImplementedError("async_scheduling 仅 UniProc 支持")
+
     @abstractmethod
     def shutdown(self) -> None:
         ...

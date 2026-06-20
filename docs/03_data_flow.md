@@ -334,7 +334,7 @@ attn_md = AttentionMetadata(query_start_loc=cu_seqlens_q, cu_seqlens_k=cu_seqlen
 ### FlashAttention（前缀缓存路径）
 
 ```python
-# layers/attention/flash_attn.py：block_table 非 None 即统一从分页 cache 读历史
+# attention/flash_attn.py：block_table 非 None 即统一从分页 cache 读历史
 o = flash_attn_varlen_func(
     q,           # 只有本步的 query（len(seqC)-256 个）
     k_cache, v_cache,                 # 整个 KV cache 张量（FA 按 block_table 读取）

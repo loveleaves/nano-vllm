@@ -41,7 +41,7 @@ class TestSchedulerFCFS:
     @pytest.mark.unit
     def test_schedule_returns_scheduler_output(self):
         sched = _make_sched()
-        sched.add(_make_seq(3))
+        sched.add_request(_make_seq(3))
         out = sched.schedule()
         assert isinstance(out, SchedulerOutput)
         assert out.total_num_scheduled_tokens == 3
@@ -51,7 +51,7 @@ class TestSchedulerFCFS:
     def test_schedule_prefill_first(self):
         sched = _make_sched()
         seq = _make_seq(3)
-        sched.add(seq)
+        sched.add_request(seq)
         out, seqs, num_scheduled = _sched(sched)
         assert num_scheduled[seq.seq_id] == 3   # prefill chunk 调度 3 token
         assert seq in seqs
@@ -62,7 +62,7 @@ class TestSchedulerFCFS:
     def test_prefill_then_decode_transition(self):
         sched = _make_sched()
         seq = _make_seq(3)
-        sched.add(seq)
+        sched.add_request(seq)
         out, seqs, p = _sched(sched)
         sched.update_from_output(out, [10])
         assert seq.num_tokens == 4
@@ -76,7 +76,7 @@ class TestSchedulerFCFS:
     def test_eos_terminates_sequence(self):
         sched = _make_sched(eos=999)
         seq = _make_seq(2)
-        sched.add(seq)
+        sched.add_request(seq)
         out, seqs, p = _sched(sched)
         sched.update_from_output(out, [999])
         assert seq.is_finished and sched.is_finished()
@@ -85,7 +85,7 @@ class TestSchedulerFCFS:
     def test_max_tokens_terminates_sequence(self):
         sched = _make_sched()
         seq = Sequence([1, 2, 3], SamplingParams(max_tokens=3))
-        sched.add(seq)
+        sched.add_request(seq)
         for token in [10, 20, 30]:
             out, seqs, p = _sched(sched)
             sched.update_from_output(out, [token])
@@ -95,7 +95,7 @@ class TestSchedulerFCFS:
     def test_ignore_eos_flag(self):
         sched = _make_sched(eos=999)
         seq = Sequence([1], SamplingParams(max_tokens=3, ignore_eos=True))
-        sched.add(seq)
+        sched.add_request(seq)
         for _ in range(2):
             out, seqs, p = _sched(sched)
             sched.update_from_output(out, [999])
@@ -108,8 +108,8 @@ class TestSchedulerFCFS:
     def test_token_budget_fills_across_seqs(self):
         # 统一连续批：任意 seq 可分块，预算跨 seq 填满（不再限队首）
         sched = _make_sched(max_num_batched_tokens=10)
-        sched.add(_make_seq(8))
-        sched.add(_make_seq(8))
+        sched.add_request(_make_seq(8))
+        sched.add_request(_make_seq(8))
         out, seqs, num_scheduled = _sched(sched)
         assert sum(num_scheduled.values()) == 10   # 预算恰好填满
         assert out.total_num_scheduled_tokens == 10
@@ -120,14 +120,14 @@ class TestSchedulerFCFS:
     def test_max_num_seqs_limits_batch(self):
         sched = _make_sched(max_num_seqs=2)
         for _ in range(5):
-            sched.add(_make_seq(2))
+            sched.add_request(_make_seq(2))
         out, seqs, _ = _sched(sched)
         assert len(seqs) <= 2
 
     @pytest.mark.unit
     def test_memory_full_returns_empty_list(self):
         sched = _make_sched(num_blocks=2)
-        sched.add(_make_seq(12))   # 需要 3 块
+        sched.add_request(_make_seq(12))   # 需要 3 块
         out, seqs, num_scheduled = _sched(sched)
         assert seqs == [] and not num_scheduled and out.is_empty
 
@@ -135,7 +135,7 @@ class TestSchedulerFCFS:
     def test_full_lifecycle(self):
         sched = _make_sched()
         seq = Sequence([10, 20], SamplingParams(max_tokens=3))
-        sched.add(seq)
+        sched.add_request(seq)
         for token in [100, 200, 300]:
             out, seqs, p = _sched(sched)
             sched.update_from_output(out, [token])
@@ -148,8 +148,8 @@ class TestSchedulerFCFS:
         sp = SamplingParams(max_tokens=2)
         seq1 = Sequence([1, 2], sp)
         seq2 = Sequence([3, 4], sp)
-        sched.add(seq1)
-        sched.add(seq2)
+        sched.add_request(seq1)
+        sched.add_request(seq2)
         out, seqs, p = _sched(sched)
         assert len(seqs) == 2
         sched.update_from_output(out, [10, 20])
@@ -160,24 +160,24 @@ class TestSchedulerFCFS:
     @pytest.mark.unit
     def test_blocks_released_on_finish(self):
         sched = _make_sched()
-        initial_free = len(sched.block_manager.free_block_ids)
+        initial_free = len(sched.block_manager.block_pool.free_block_ids)
         seq = Sequence([1, 2, 3], SamplingParams(max_tokens=1))
-        sched.add(seq)
+        sched.add_request(seq)
         out, seqs, p = _sched(sched)
         sched.update_from_output(out, [10])
         assert sched.is_finished()
-        assert len(sched.block_manager.free_block_ids) == initial_free
+        assert len(sched.block_manager.block_pool.free_block_ids) == initial_free
 
     @pytest.mark.unit
     def test_abort_releases_blocks_and_request(self):
         sched = _make_sched()
-        initial_free = len(sched.block_manager.free_block_ids)
+        initial_free = len(sched.block_manager.block_pool.free_block_ids)
         seq = _make_seq(3)
-        sched.add(seq)
+        sched.add_request(seq)
         out, seqs, p = _sched(sched)         # prefill → running，占块
         sched.abort(seq)
         assert seq.is_finished and sched.is_finished()
-        assert len(sched.block_manager.free_block_ids) == initial_free
+        assert len(sched.block_manager.block_pool.free_block_ids) == initial_free
 
 
 # ─── Phase 4：Chunked Prefill ───────────────────────────────────────────────────
@@ -200,7 +200,7 @@ class TestSchedulerChunkedPrefill:
     def test_chunked_prefill_two_rounds(self):
         sched = _make_sched_p4(num_blocks=10, max_batched_tokens=4)
         seq = _make_seq_p4(8)
-        sched.add(seq)
+        sched.add_request(seq)
 
         out, seqs, ns = _sched(sched)
         assert out.total_num_scheduled_tokens == 4 and len(seqs) == 1
@@ -222,8 +222,8 @@ class TestSchedulerChunkedPrefill:
         sched = _make_sched_p4(num_blocks=20, max_batched_tokens=4)
         seq1 = _make_seq_p4(8)
         seq2 = _make_seq_p4(4)
-        sched.add(seq1)
-        sched.add(seq2)
+        sched.add_request(seq1)
+        sched.add_request(seq2)
 
         out, seqs, ns = _sched(sched)
         assert out.total_num_scheduled_tokens == 4 and len(seqs) == 1
@@ -233,7 +233,7 @@ class TestSchedulerChunkedPrefill:
     def test_chunked_seq_stays_in_waiting(self):
         sched = _make_sched_p4(num_blocks=10, max_batched_tokens=4)
         seq = _make_seq_p4(8)
-        sched.add(seq)
+        sched.add_request(seq)
 
         out, seqs, ns = _sched(sched)
         sched.update_from_output(out, [0])
@@ -253,8 +253,8 @@ class TestSchedulerPreemption:
         sched = _make_sched_p4(num_blocks=2, max_batched_tokens=8)
         seq1 = _make_seq_p4(4)   # 占 1 块
         seq2 = _make_seq_p4(4)   # 占 1 块
-        sched.add(seq1)
-        sched.add(seq2)
+        sched.add_request(seq1)
+        sched.add_request(seq2)
 
         # 第一步：两个 seq 同批 prefill 完成，各占 1 块（块用尽）
         out, seqs, ns = _sched(sched)
@@ -272,7 +272,7 @@ class TestSchedulerPreemption:
     def test_preempt_restores_seq_to_waiting_head(self):
         sched = _make_sched_p4(num_blocks=10, max_batched_tokens=8)
         seq = _make_seq_p4(4)
-        sched.add(seq)
+        sched.add_request(seq)
 
         out, seqs, ns = _sched(sched)
         sched.update_from_output(out, [1])
@@ -288,7 +288,7 @@ class TestSchedulerPreemption:
     def test_memory_full_deadlock_protection(self):
         sched = _make_sched_p4(num_blocks=1, max_batched_tokens=16)
         seq = _make_seq_p4(8)   # 需要 2 块，只有 1 块 → 无法调度
-        sched.add(seq)
+        sched.add_request(seq)
 
         out, seqs, num_scheduled = _sched(sched)
         assert seqs == [] and not num_scheduled
@@ -305,13 +305,13 @@ class TestSchedulerContinuousBatching:
         # 下一步调度应在同一批里同时含 decode(seq1) 与 prefill(seq2)
         sched = _make_sched(max_num_batched_tokens=64)
         seq1 = _make_seq(3)
-        sched.add(seq1)
+        sched.add_request(seq1)
         out, seqs, ns = _sched(sched)         # 第一步：seq1 prefill
         sched.update_from_output(out, [10])
         assert seq1.status == SequenceStatus.RUNNING
 
         seq2 = _make_seq(5)
-        sched.add(seq2)
+        sched.add_request(seq2)
         out, seqs, ns = _sched(sched)         # 第二步：seq1 decode + seq2 prefill
 
         assert seq1 in seqs and seq2 in seqs
@@ -324,8 +324,8 @@ class TestSchedulerContinuousBatching:
     def test_decode_only_batch_all_ones(self):
         sched = _make_sched()
         s1, s2 = _make_seq(2), _make_seq(2)
-        sched.add(s1)
-        sched.add(s2)
+        sched.add_request(s1)
+        sched.add_request(s2)
         out, seqs, ns = _sched(sched)         # prefill 两者
         sched.update_from_output(out, [10, 20])
         out, seqs, ns = _sched(sched)         # 纯 decode 批
@@ -345,7 +345,7 @@ class TestPriorityScheduling:
         # 后到但高优先级（值小）应先被调度
         low = Sequence(list(range(2)), SamplingParams(max_tokens=5), priority=0)
         high = Sequence(list(range(2)), SamplingParams(max_tokens=5), priority=5)
-        sched.add(high)   # 先加低优先级
-        sched.add(low)    # 后加高优先级
+        sched.add_request(high)   # 先加低优先级
+        sched.add_request(low)    # 后加高优先级
         out, seqs, ns = _sched(sched)
         assert seqs[0] is low   # priority=0 先于 priority=5

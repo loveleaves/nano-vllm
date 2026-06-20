@@ -29,6 +29,8 @@ class FakeTokenizer:
 
 
 class FakeEngineCore:
+    """假 EngineCoreClient：实现前端依赖的客户端接口（get_output_async 等）。"""
+
     def __init__(self, script: list[EngineCoreOutputs]):
         self.script = script
         self.i = 0
@@ -41,10 +43,13 @@ class FakeEngineCore:
     def has_unfinished_requests(self) -> bool:
         return self.i < len(self.script)
 
-    def step(self) -> EngineCoreOutputs:
+    def get_output(self) -> EngineCoreOutputs:
         out = self.script[self.i]
         self.i += 1
         return out
+
+    async def get_output_async(self) -> EngineCoreOutputs:
+        return self.get_output()
 
     def abort_requests(self, ids):
         self.aborted.extend(ids)

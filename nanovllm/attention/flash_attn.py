@@ -7,11 +7,11 @@ try:
 except ImportError:
     HAS_FLASH_ATTN = False
 
-from nanovllm.layers.attention.backend import (
+from nanovllm.attention.backend import (
     AttentionBackend, AttentionImpl, AttentionMetadataBuilder,
 )
-from nanovllm.layers.attention.common import CommonAttentionMetadata
-from nanovllm.layers.attention.kv_ops import store_kvcache
+from nanovllm.attention.common import CommonAttentionMetadata
+from nanovllm.attention.kv_ops import store_kvcache
 
 
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):

@@ -8,7 +8,7 @@ import pytest
 
 from nanovllm.engine.core import EngineCore
 from nanovllm.engine.core_types import EngineCoreRequest, FinishReason
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.sched import Scheduler
 from nanovllm.engine.sequence import Sequence
 from nanovllm.sampling_params import SamplingParams
 
@@ -31,6 +31,8 @@ def _make_core(token: int, block_size=4, num_blocks=32,
     ec.scheduler = Scheduler(num_blocks, block_size, max_num_seqs=8,
                              max_num_batched_tokens=max_num_batched_tokens, eos=eos)
     ec.requests = {}
+    ec.async_scheduling = False
+    ec._inflight = None
     return ec
 
 

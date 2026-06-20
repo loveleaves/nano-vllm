@@ -24,27 +24,6 @@ class KVCacheManager:
         self.free_swap_slots: deque[int] = deque(range(num_swap_blocks))
         self.swapped_slots: dict[int, list[int]] = {}
 
-    # ── 向后兼容：旧 BlockManager 直接访问的属性/类方法 ───────────────────────────
-    @property
-    def blocks(self):
-        return self.block_pool.blocks
-
-    @property
-    def free_block_ids(self):
-        return self.block_pool.free_block_ids
-
-    @property
-    def used_block_ids(self):
-        return self.block_pool.used_block_ids
-
-    @property
-    def hash_to_block_id(self):
-        return self.block_pool.hash_to_block_id
-
-    @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1) -> int:
-        return BlockPool.compute_hash(token_ids, prefix)
-
     # ── 每请求块管理 ──────────────────────────────────────────────────────────
     def can_allocate(self, seq: Sequence) -> int:
         """
@@ -158,7 +137,3 @@ class KVCacheManager:
             token_ids = seq.block(i)
             h = pool.compute_hash(token_ids, h)
             pool.register_hash(seq.block_table[i], h, token_ids)
-
-
-# 向后兼容别名：旧名 BlockManager
-BlockManager = KVCacheManager

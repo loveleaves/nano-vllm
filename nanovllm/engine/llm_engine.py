@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.core import EngineCore
+from nanovllm.engine.core_client import EngineCoreClient
 from nanovllm.engine.core_types import RequestOutput
 from nanovllm.engine.processor import Processor
 from nanovllm.engine.output_processor import OutputProcessor
@@ -17,9 +17,10 @@ class LLMEngine:
     同步推理引擎入口（V1 风格组件装配，见 docs/arch_engine/design.md）。
 
     分层（对齐 vLLM V1 LLMEngine）：
-      Processor        — 输入处理：tokenize → EngineCoreRequest
-      EngineCore       — 调度 + 执行循环（持有 Scheduler + Worker，含多进程 TP）
-      OutputProcessor  — 增量 detokenize / 停止串 / finish reason → RequestOutput
+      Processor         — 输入处理：tokenize → EngineCoreRequest
+      EngineCoreClient  — 调度 + 执行核心的句柄（InprocClient 同进程 / MPClient 独立进程，
+                          由 config.multiproc_engine_core 选择；前者驱动 step，后者收 busy-loop 产出）
+      OutputProcessor   — 增量 detokenize / 停止串 / finish reason → RequestOutput
 
     本类只做装配与编排，不含调度、kernel 或文本处理细节。流式/异步入口见 AsyncLLM。
     """
@@ -33,7 +34,7 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
 
         self.processor = Processor(self.tokenizer)
-        self.engine_core = EngineCore(config)
+        self.engine_core = EngineCoreClient.make_client(config)
         self.output_processor = OutputProcessor(self.tokenizer)
 
     def exit(self):
@@ -48,8 +49,10 @@ class LLMEngine:
         return req.request_id
 
     def step(self) -> tuple[list[RequestOutput], int]:
-        """推进一步：EngineCore.step → OutputProcessor → 处理输出侧 abort。"""
-        core_outputs = self.engine_core.step()
+        """推进一步：取核心产出 → OutputProcessor → 处理输出侧 abort。
+
+        get_output：InprocClient 即同步 step()；MPClient 阻塞读子进程 busy-loop 的下一批产出。"""
+        core_outputs = self.engine_core.get_output()
         processed = self.output_processor.process_outputs(core_outputs.outputs)
         if processed.reqs_to_abort:
             self.engine_core.abort_requests(processed.reqs_to_abort)

@@ -35,6 +35,9 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     num_swap_blocks: int = 0   # CPU swap 区块数（>0 时抢占走 swap 而非 recompute；仅 TP=1 内联支持）
+    async_scheduling: bool = False   # 异步调度：step N 的 GPU 计算与 step N+1 的 CPU 调度重叠（仅 TP=1 内联，与 swap 互斥）
+    multiproc_engine_core: bool = False   # EngineCore 进程化：调度+执行核心跑在独立子进程（busy-loop + mp.Queue），
+                                          # 前端（tokenize/detokenize/HTTP）与 GPU 调度解耦；默认 False 走同进程 InprocClient
     scheduling_policy: str = "fcfs"
     hf_config: object = field(default=None, repr=False)
     eos: int = -1
@@ -46,6 +49,13 @@ class Config:
         assert self.distributed_executor_backend in (None, "uni", "mp")
         assert 1 <= self.tensor_parallel_size <= 8
         assert 0.0 < self.gpu_memory_utilization <= 1.0
+        if self.async_scheduling:
+            # 异步调度的 token 前向依赖采样 token 留在 GPU + 单进程内联流水，
+            # 暂不支持进程隔离（mp）与 swap 抢占（换出会让在飞 token 张量失效）
+            assert self.tensor_parallel_size == 1, "async_scheduling 仅支持 TP=1"
+            assert self.distributed_executor_backend in (None, "uni"), \
+                "async_scheduling 仅支持 UniProc（不支持 mp 进程隔离）"
+            assert self.num_swap_blocks == 0, "async_scheduling 与 swap 抢占互斥"
 
         # 延迟导入 transformers，避免在纯 Python 测试中不必要的依赖
         try:

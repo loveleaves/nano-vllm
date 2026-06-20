@@ -2,7 +2,7 @@
 import pytest
 
 from nanovllm.engine.metrics import SchedulerStats, StatLogger
-from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.sched import Scheduler
 from nanovllm.engine.sequence import Sequence
 from nanovllm.sampling_params import SamplingParams
 
@@ -45,8 +45,8 @@ class TestSchedulerMakeStats:
         Sequence.block_size = 4
         sch = Scheduler(num_kvcache_blocks=16, block_size=4, max_num_seqs=8,
                         max_num_batched_tokens=64, eos=999)
-        sch.add(Sequence([1, 2, 3], SamplingParams()))
-        sch.add(Sequence([4, 5], SamplingParams()))
+        sch.add_request(Sequence([1, 2, 3], SamplingParams()))
+        sch.add_request(Sequence([4, 5], SamplingParams()))
         sch.schedule()                         # 两个 prompt 进入调度、分配块
         st = sch.make_stats(num_scheduled_tokens=5)
         assert st.num_scheduled_tokens == 5

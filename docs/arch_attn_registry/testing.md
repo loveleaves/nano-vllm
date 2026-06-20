@@ -5,7 +5,7 @@
 | 分组 | 覆盖点 |
 |---|---|
 | `TestBackendTriad` | 三件套类型（C 轮，不变） |
-| `TestSelector` | is_cuda 旧签名向后兼容：cpu→sdpa、cuda→flash(若装)、env 强制、非法 env 报错 |
+| `TestSelector` | `device_type` 选择：cpu→sdpa、cuda→flash(若装)、env 强制、非法 env 报错 |
 | `TestCapabilitySelection`（新） | flash `supports_head_size`(128✓/320✗/100✗) / `supports_dtype`(bf16✓/fp32✗) / `is_available("cpu")`✗；sdpa 全许可；**cuda+head=300→回退 sdpa**；**cuda+fp32→回退 sdpa**，bf16+128→flash |
 | `TestRegistry`（新） | `enum.get_class()` 解析；`from_name` 大小写不敏感 + 非法报错；`register_backend` 覆盖后 get_class 解析到替身、`clear_override` 还原 |
 | `TestAttentionLayerBinding` | Attention.__init__ 在 CPU 绑定 SDPAImpl；forward 委派形状 |

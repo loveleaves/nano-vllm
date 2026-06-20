@@ -429,7 +429,7 @@ SRAM 大小：A100 = 192 KB per SM，约可存 tile_q=128 行，tile_k=64 列（
 #### 统一 `flash_attn_varlen_func`（prefill + decode 同一接口，C 轮统一）
 
 C 轮对齐后**不再分 prefill / decode 两个 flash 接口**：统一用 `flash_attn_varlen_func` 一个调用覆盖
-（decode = query_len 1 的退化，prefix-cache = `cu_k > cu_q` 的特例）。`layers/attention/flash_attn.py`：
+（decode = query_len 1 的退化，prefix-cache = `cu_k > cu_q` 的特例）。`attention/flash_attn.py`：
 
 ```python
 o = flash_attn_varlen_func(
@@ -505,14 +505,14 @@ KV 长度的 decode。
 
 ## 8. Token 采样（结构化采样层）
 
-**J 轮对齐 V1** 后，采样从单函数升级为结构化层 `layers/sample/`：`SamplingMetadata`（按行批配置）+
+**J 轮对齐 V1** 后，采样从单函数升级为结构化层 `sample/`：`SamplingMetadata`（按行批配置）+
 `Sampler` + `ops/{topk_topp, penalties, logprobs}`，支持**真·greedy（temperature=0）、top-k、top-p、
 presence/frequency/repetition 惩罚、logprobs**，并按行混合 greedy/随机。
 
 ### 8.1 Sampler 主流程
 
 ```python
-# layers/sample/sampler.py（要点）
+# sample/sampler.py（要点）
 if max_num_logprobs is not None: raw_logprobs = compute_logprobs(logits)  # 取惩罚/温度前
 logits = logits.float()
 if not no_penalties: logits = apply_all_penalties(...)                    # rep(prompt∪output)+freq+pres

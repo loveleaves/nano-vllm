@@ -7,10 +7,13 @@ AsyncLLM：异步流式入口（对齐 vLLM V1 `v1/engine/async_llm.py`）。
 
 并发模型（单进程、教学化简）：
   - 一个后台 output_handler 协程驱动循环；
-  - 每步把阻塞的 `EngineCore.step()`（GPU + 多进程 TP）丢进默认线程池执行，
-    torch 在 kernel 期间释放 GIL，故事件循环不被阻塞；
-  - 新请求经 _pending 列表交给 handler，在 **handler 协程内**（非线程内）落入
-    Scheduler，从而与正在执行的 step 天然错开，避免对调度结构的并发改写。
+  - 每步把阻塞的 `client.get_output()` 丢进默认线程池执行：InprocClient 下即同进程
+    `EngineCore.step()`（torch kernel 期间释放 GIL），MPClient 下即阻塞读子进程
+    busy-loop 的下一批产出——两种实现对事件循环都非阻塞；
+  - 新请求经 _pending 列表交给 handler，在 **handler 协程内**（非线程内）落入核心，
+    从而与正在执行的 step 天然错开，避免对调度结构的并发改写。
+
+进程拓扑由 config.multiproc_engine_core 决定（默认同进程 InprocClient）。
 """
 import asyncio
 from dataclasses import fields
@@ -19,7 +22,7 @@ from transformers import AutoTokenizer
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.core import EngineCore
+from nanovllm.engine.core_client import EngineCoreClient
 from nanovllm.engine.core_types import EngineCoreRequest, RequestOutput
 from nanovllm.engine.processor import Processor
 from nanovllm.engine.output_processor import OutputProcessor
@@ -49,7 +52,7 @@ class AsyncLLM:
         config.eos = self.tokenizer.eos_token_id
 
         self.processor = Processor(self.tokenizer)
-        self.engine_core = EngineCore(config)
+        self.engine_core = EngineCoreClient.make_client(config)
         self.output_processor = OutputProcessor(self.tokenizer)
 
         self.collectors: dict[str, RequestOutputCollector] = {}
@@ -65,15 +68,14 @@ class AsyncLLM:
             self._handler_task = asyncio.create_task(self._run_output_handler())
 
     async def _run_output_handler(self):
-        loop = asyncio.get_running_loop()
         while True:
-            # 在 handler 协程内把新请求落入 Scheduler（与 step 错开，无并发写）
+            # 在 handler 协程内把新请求落入核心（与 step 错开，无并发写）
             while self._pending:
                 self.engine_core.add_request(self._pending.pop(0))
             if not self.engine_core.has_unfinished_requests():
                 break  # 空闲：退出，新请求到来时由 _ensure_handler 重启
 
-            core_outputs = await loop.run_in_executor(None, self.engine_core.step)
+            core_outputs = await self.engine_core.get_output_async()
             processed = self.output_processor.process_outputs(core_outputs.outputs)
             if processed.reqs_to_abort:
                 self.engine_core.abort_requests(processed.reqs_to_abort)

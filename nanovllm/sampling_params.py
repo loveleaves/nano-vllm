@@ -21,6 +21,9 @@ class SamplingParams:
       logprobs           — 每步返回的 top-logprobs 个数（None 不返回）
       seed               — 随机采样种子（None 不固定）；同一请求跨步用持久 generator 续流
       bad_words_token_ids— 禁止生成的 token 序列列表；某序列前缀匹配已生成尾部时屏蔽其末 token
+      logit_bias         — {token_id: bias}，在对应 logit 上加偏置（OpenAI logit_bias）
+      min_tokens         — 最小生成 token 数：未达前抑制 EOS，强制继续（0 关闭）
+      guided_choice      — 引导解码：输出须等于其中之一（list[str]）；仅 UniProc 执行器支持
     """
     temperature: float = 1.0
     max_tokens: int = 64
@@ -35,6 +38,9 @@ class SamplingParams:
     logprobs: int | None = None
     seed: int | None = None
     bad_words_token_ids: list[list[int]] | None = None
+    logit_bias: dict[int, float] | None = None
+    min_tokens: int = 0
+    guided_choice: list[str] | None = None
 
     def __post_init__(self):
         assert self.temperature >= 0.0, "temperature 必须 >= 0（0 表示 greedy）"
@@ -43,5 +49,7 @@ class SamplingParams:
         assert self.repetition_penalty > 0.0, "repetition_penalty 必须 > 0"
         assert 0.0 <= self.min_p <= 1.0, "min_p 必须落在 [0, 1]"
         assert self.logprobs is None or self.logprobs >= 0, "logprobs 必须 >= 0"
+        assert self.min_tokens >= 0, "min_tokens 必须 >= 0"
+        assert self.min_tokens <= self.max_tokens, "min_tokens 不能超过 max_tokens"
         if isinstance(self.stop, str):
             self.stop = [self.stop]

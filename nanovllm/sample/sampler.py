@@ -1,19 +1,20 @@
 """
 采样器（对齐 vLLM V1 `v1/sample/sampler.py::Sampler`）。
 
-按 SamplingMetadata 对一批 logits 依次：可选 logprobs 留存 → float32 → 惩罚 → 采样
+按 SamplingMetadata 对一批 logits 依次：可选 logprobs 留存 → float32 →
+**LogitsProcessor 链**（惩罚 / bad_words / logit_bias / min_tokens / 引导）→ 采样
 （greedy / 温度 + top-k/top-p 随机，逐行按温度决定）→ 收集 logprobs → SamplerOutput。
 
-nano 子集：不含 bad_words / allowed_token_ids / min_p / logits_processors / spec。
+惩罚 / bad_words 已收编进 logits_processor 框架（见 sample/logits_processor/）；引导解码
+（guided/）作为链中最后一个处理器，采样后由本类推进各行 Grammar 状态。
 """
 import torch
 from torch import nn
 
 from nanovllm.sample.metadata import SamplingMetadata
 from nanovllm.sample.outputs import SamplerOutput
-from nanovllm.sample.ops.bad_words import apply_bad_words
+from nanovllm.sample.logits_processor import build_logits_processors
 from nanovllm.sample.ops.logprobs import compute_logprobs, gather_logprobs
-from nanovllm.sample.ops.penalties import apply_all_penalties
 from nanovllm.sample.ops.topk_topp import TopKTopPSampler, apply_min_p
 
 _SAMPLING_EPS = 1e-5
@@ -21,40 +22,42 @@ _SAMPLING_EPS = 1e-5
 
 class Sampler(nn.Module):
 
-    def __init__(self):
+    def __init__(self, logits_processors=None):
         super().__init__()
         self.topk_topp_sampler = TopKTopPSampler()
+        # 有序 LogitsProcessor 链（默认：惩罚→bad_words→logit_bias→min_tokens→引导）
+        self.logits_processors = (build_logits_processors()
+                                  if logits_processors is None else logits_processors)
 
     def forward(self, logits: torch.Tensor,
                 sampling_metadata: SamplingMetadata) -> SamplerOutput:
         num_logprobs = sampling_metadata.max_num_logprobs
-        # 原始（惩罚/温度前）logits 的 logprobs，对齐 V1（与 V0 不同）
+        # 原始（处理器/温度前）logits 的 logprobs，对齐 V1（与 V0 不同）
         raw_logprobs = None
         if num_logprobs is not None:
             raw_logprobs = compute_logprobs(logits)
 
         logits = logits.float()
-        if not sampling_metadata.no_penalties:
-            logits = apply_all_penalties(
-                logits,
-                sampling_metadata.prompt_token_ids,
-                sampling_metadata.output_token_ids,
-                sampling_metadata.presence_penalties,
-                sampling_metadata.frequency_penalties,
-                sampling_metadata.repetition_penalties,
-            )
-        if sampling_metadata.bad_words_token_ids:
-            logits = apply_bad_words(
-                logits, sampling_metadata.bad_words_token_ids,
-                sampling_metadata.output_token_ids)
+        for processor in self.logits_processors:
+            logits = processor.apply(logits, sampling_metadata)
 
         sampled = self.sample(logits, sampling_metadata).long()
+        self._advance_grammars(sampled, sampling_metadata)
 
         logprobs_tensors = None
         if num_logprobs is not None:
             logprobs_tensors = gather_logprobs(raw_logprobs, num_logprobs, sampled)
         return SamplerOutput(sampled_token_ids=sampled,
                              logprobs_tensors=logprobs_tensors)
+
+    @staticmethod
+    def _advance_grammars(sampled: torch.Tensor, metadata: SamplingMetadata):
+        """采样后推进受约束行的 Grammar 状态（引导解码）。"""
+        if not metadata.grammars:
+            return
+        flat = sampled.view(-1).tolist()
+        for row, grammar in metadata.grammars.items():
+            grammar.accept(flat[row])
 
     def sample(self, logits: torch.Tensor,
                sampling_metadata: SamplingMetadata) -> torch.Tensor:

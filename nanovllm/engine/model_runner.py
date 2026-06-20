@@ -261,6 +261,16 @@ class ModelRunner:
         lp = [seq.logprobs for seq in seqs if seq.logprobs is not None]
         max_num_logprobs = min(max(lp), vocab_size - 1) if lp else None
 
+        # LogitsProcessor 框架字段：logit_bias / min_tokens / 引导 grammar
+        logit_bias = {i: seq.logit_bias for i, seq in enumerate(seqs) if seq.logit_bias}
+        min_tokens = {i: seq.min_tokens for i, seq in enumerate(seqs) if seq.min_tokens}
+        grammars = {i: seq.grammar for i, seq in enumerate(seqs)
+                    if getattr(seq, "grammar", None) is not None}
+        # min_tokens / grammar 需 output 历史长度判定；确保 output_ids 已就绪
+        if (min_tokens or grammars) and output_ids is None:
+            output_ids = [seq.completion_token_ids for seq in seqs]
+        eos = self.config.eos if self.config.eos != -1 else None
+
         return SamplingMetadata(
             temperature=temperature, all_greedy=all_greedy, all_random=all_random,
             top_p=top_p, top_k=top_k, min_p=min_p,
@@ -268,6 +278,8 @@ class ModelRunner:
             no_penalties=no_penalties, prompt_token_ids=prompt_ids,
             output_token_ids=output_ids, frequency_penalties=freq_t,
             presence_penalties=pres_t, repetition_penalties=rep_t,
+            logit_bias=logit_bias or None, min_tokens=min_tokens or None,
+            eos_token_id=eos, grammars=grammars or None,
             max_num_logprobs=max_num_logprobs,
         )
 
@@ -299,6 +311,38 @@ class ModelRunner:
         gv["block_tables"][:bs, :attn_md.block_table.size(1)] = attn_md.block_table
         graph.replay()
         return self.model.compute_logits(gv["outputs"][:bs], attn_md)
+
+    @torch.inference_mode()
+    def verify_spec(self, seq: Sequence, num_drafts: int) -> list[int]:
+        """投机解码验证（GPU，仅 UniProc）：目标模型并行前向 num_drafts+1 个位置，
+        返回各位置贪心 argmax（共 num_drafts+1 个 token）。
+
+        调用前 seq 已投机追加 num_drafts 个草案 token、块表覆盖到末位。前向 query 为
+        [token@(L0-1), 草案0..草案k-1]（k+1 个位置），写入它们的 KV（被拒绝位的 KV 由后续
+        步覆盖），并对**全部** k+1 个位置取 lm_head（不做末位聚合）后 argmax。
+        """
+        k = num_drafts
+        n_kv = seq.num_tokens                       # = L0 + k（已含草案）
+        start = n_kv - (k + 1)                      # L0 - 1
+        positions = list(range(start, n_kv))        # k+1 个 query 位置
+        block_size = self.block_size
+        bt = seq.block_table
+        slots = [bt[p // block_size] * block_size + (p % block_size) for p in positions]
+
+        dev = "cuda"
+        input_ids = torch.tensor(seq.token_ids[start:n_kv], dtype=torch.int64, device=dev)
+        pos_t = torch.tensor(positions, dtype=torch.int64, device=dev)
+        attn_md = AttentionMetadata(
+            query_start_loc=torch.tensor([0, k + 1], dtype=torch.int32, device=dev),
+            cu_seqlens_k=torch.tensor([0, n_kv], dtype=torch.int32, device=dev),
+            max_query_len=k + 1, max_seq_len=n_kv,
+            slot_mapping=torch.tensor(slots, dtype=torch.int64, device=dev),
+            block_table=torch.tensor([bt], dtype=torch.int32, device=dev),
+        )
+        hidden = self.model(input_ids, pos_t, attn_md)
+        # 全位置 logits（attn_md=None → lm_head 不做末位聚合）
+        logits = self.model.lm_head(hidden, None)
+        return logits.argmax(dim=-1).tolist()
 
     def run(self, seqs: list[Sequence], finished_seq_ids: set[int] | None = None):
         """单步推理接口。统一连续批，经常驻 InputBatch 增量构造输入。

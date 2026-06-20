@@ -11,6 +11,7 @@ from itertools import count
 
 from nanovllm.engine.core_types import EngineCoreRequest
 from nanovllm.sampling_params import SamplingParams
+from nanovllm.sample.guided import build_grammar
 
 
 class Processor:
@@ -38,9 +39,13 @@ class Processor:
         else:
             prompt_token_ids = list(prompt)
         assert prompt_token_ids, "prompt 不能为空"
+        # 引导解码：用 tokenizer 把候选编码成 token 序列，构造 Grammar 随请求下发
+        grammar = build_grammar(sampling_params.guided_choice, self.tokenizer,
+                                self.tokenizer.eos_token_id)
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
             priority=priority,
+            grammar=grammar,
         )

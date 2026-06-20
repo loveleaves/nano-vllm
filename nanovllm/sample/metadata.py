@@ -46,4 +46,10 @@ class SamplingMetadata:
     presence_penalties: torch.Tensor | None = None
     repetition_penalties: torch.Tensor | None = None
 
+    # ── LogitsProcessor 框架字段（None/空 → 对应处理器整批 no-op）──────────────
+    logit_bias: dict[int, dict[int, float]] | None = None   # 行 → {token_id: bias}
+    min_tokens: dict[int, int] | None = None                # 行 → 最小生成长度（未达则抑制 EOS）
+    eos_token_id: int | None = None                         # min_tokens / 引导完成用
+    grammars: dict[int, object] | None = None               # 行 → Grammar（引导解码，仅 UniProc）
+
     max_num_logprobs: int | None = None

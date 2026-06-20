@@ -65,8 +65,14 @@ class _SamplingMixin(BaseModel):
     stop: str | list[str] | None = None
     ignore_eos: bool = False
     n: int = 1
+    # OpenAI logit_bias：{token_id(str): bias}；vLLM 扩展：min_tokens / guided_choice
+    logit_bias: dict[str, float] | None = None
+    min_tokens: int = 0
+    guided_choice: list[str] | None = None
 
     def to_sampling_params(self) -> SamplingParams:
+        logit_bias = ({int(k): v for k, v in self.logit_bias.items()}
+                      if self.logit_bias else None)
         return SamplingParams(
             temperature=self.temperature,
             max_tokens=self.max_tokens or 64,
@@ -79,6 +85,9 @@ class _SamplingMixin(BaseModel):
             frequency_penalty=self.frequency_penalty,
             repetition_penalty=self.repetition_penalty,
             seed=self.seed,
+            logit_bias=logit_bias,
+            min_tokens=self.min_tokens,
+            guided_choice=self.guided_choice,
             logprobs=getattr(self, "_logprobs_n", None),
         )
 

@@ -22,6 +22,9 @@ class UniProcExecutor(Executor):
         if blocks_to_swap_in or blocks_to_swap_out:
             self.worker.model_runner.execute_swap(blocks_to_swap_in, blocks_to_swap_out)
 
+    def verify_spec(self, seq, num_drafts: int) -> list[int]:
+        return self.worker.model_runner.verify_spec(seq, num_drafts)
+
     def execute_model_async(self, seqs, finished_seq_ids=None) -> None:
         self.worker.model_runner.execute_model_async(seqs, finished_seq_ids)
 

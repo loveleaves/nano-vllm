@@ -55,6 +55,10 @@ class Executor(ABC):
             raise NotImplementedError(
                 "swap 抢占仅 UniProc（TP=1 内联）支持；MultiProc 需扩展 RPC 载荷")
 
+    def verify_spec(self, seq, num_drafts: int) -> list[int]:
+        """投机解码：目标模型并行验证 num_drafts+1 个位置，返回各位 argmax（仅 UniProc）。"""
+        raise NotImplementedError("投机解码仅 UniProc（TP=1 内联）支持")
+
     # ── 异步调度（仅 UniProc 内联实现；采样 token 留 GPU 跨步前向）────────────────
     def execute_model_async(self, seqs, finished_seq_ids=None) -> None:
         """非阻塞下发一步推理（不做 D2H 同步），结果暂存待 resolve_inflight 回收。"""

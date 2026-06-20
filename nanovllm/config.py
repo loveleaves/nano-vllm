@@ -38,6 +38,8 @@ class Config:
     async_scheduling: bool = False   # 异步调度：step N 的 GPU 计算与 step N+1 的 CPU 调度重叠（仅 TP=1 内联，与 swap 互斥）
     multiproc_engine_core: bool = False   # EngineCore 进程化：调度+执行核心跑在独立子进程（busy-loop + mp.Queue），
                                           # 前端（tokenize/detokenize/HTTP）与 GPU 调度解耦；默认 False 走同进程 InprocClient
+    speculative_num_tokens: int = 0       # 投机解码深度 k（>0 开启 n-gram 投机；一步多 token verify）；仅 UniProc
+    speculative_ngram_max: int = 3        # n-gram proposer 的最大匹配阶
     scheduling_policy: str = "fcfs"
     hf_config: object = field(default=None, repr=False)
     eos: int = -1
@@ -56,6 +58,14 @@ class Config:
             assert self.distributed_executor_backend in (None, "uni"), \
                 "async_scheduling 仅支持 UniProc（不支持 mp 进程隔离）"
             assert self.num_swap_blocks == 0, "async_scheduling 与 swap 抢占互斥"
+        if self.speculative_num_tokens > 0:
+            # 投机解码的 KV 自愈依赖 grammar/Sequence 同进程 + 多位置 verify 留在 rank0，
+            # 仅 UniProc；与 async（占位 token 语义冲突）互斥
+            assert self.tensor_parallel_size == 1, "投机解码仅支持 TP=1"
+            assert self.distributed_executor_backend in (None, "uni"), \
+                "投机解码仅支持 UniProc（不支持 mp 进程隔离）"
+            assert not self.async_scheduling, "投机解码与 async_scheduling 互斥"
+            assert self.speculative_ngram_max >= 1
 
         # 延迟导入 transformers，避免在纯 Python 测试中不必要的依赖
         try:

@@ -34,6 +34,7 @@ class EngineCoreRequest:
     prompt_token_ids: list[int]
     sampling_params: SamplingParams
     priority: int = 0   # 调度优先级（值越小越先；仅 priority 策略生效）
+    grammar: object = None   # 引导解码 Grammar（Processor 用 tokenizer 构造；仅 UniProc）
 
 
 @dataclass

@@ -63,6 +63,10 @@ class Sequence:
         self.logprobs = sampling_params.logprobs
         self.seed = sampling_params.seed
         self.bad_words_token_ids = sampling_params.bad_words_token_ids
+        self.logit_bias = sampling_params.logit_bias
+        self.min_tokens = sampling_params.min_tokens
+        # 引导解码 Grammar（由 Processor 用 tokenizer 构造后挂入；仅 UniProc 同进程推进）
+        self.grammar = None
 
     def __len__(self) -> int:
         return self.num_tokens
@@ -163,7 +167,8 @@ class Sequence:
                 self.temperature, self.top_p, self.top_k,
                 self.presence_penalty, self.frequency_penalty,
                 self.repetition_penalty, self.min_p, self.logprobs,
-                self.seed, self.bad_words_token_ids)
+                self.seed, self.bad_words_token_ids,
+                self.logit_bias, self.min_tokens)
 
     def __setstate__(self, state):
         (self.seq_id, self.num_tokens, self.num_prompt_tokens,
@@ -172,7 +177,10 @@ class Sequence:
          self.temperature, self.top_p, self.top_k,
          self.presence_penalty, self.frequency_penalty,
          self.repetition_penalty, self.min_p, self.logprobs,
-         self.seed, self.bad_words_token_ids) = state
+         self.seed, self.bad_words_token_ids,
+         self.logit_bias, self.min_tokens) = state
+        # grammar 不跨进程（仅 UniProc）；隔离模式下置 None
+        self.grammar = None
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

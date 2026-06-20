@@ -121,6 +121,16 @@ class KVCacheManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self.block_pool.get_new_block())
 
+    def truncate_blocks(self, seq: Sequence):
+        """投机解码回滚：释放超出当前 num_tokens 所需的**尾部**块（前部块保留，其 KV 不动）。
+
+        只 pop/deref 末尾多余块，已分配的前部块物理位置不变——故 verify 写入的、被接受 token
+        对应的 KV 完好（被拒绝 token 的尾部块释放，其 KV 随块回收）。
+        """
+        needed = (len(seq) + self.block_size - 1) // self.block_size
+        while len(seq.block_table) > needed:
+            self.block_pool.deref_block(seq.block_table.pop())
+
     def hash_blocks(self, seq: Sequence):
         """
         每步推理后，对本步新填满的块计算并注册哈希（供后续前缀命中）。

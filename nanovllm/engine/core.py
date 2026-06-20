@@ -20,7 +20,7 @@ from nanovllm.engine.core_types import (
 )
 from nanovllm.engine.executor import Executor
 from nanovllm.engine.sched import Scheduler, SchedulingPolicy
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 
 
 class EngineCore:
@@ -55,6 +55,14 @@ class EngineCore:
         # 异步调度：已下发 GPU 但结果尚未回收的"在飞"步（SchedulerOutput），None 表示无
         self.async_scheduling = config.async_scheduling
         self._inflight = None
+
+        # 投机解码（仅 UniProc）：n-gram 草案 + 一步多 token verify
+        self.use_spec = config.speculative_num_tokens > 0
+        self.spec_decoder = None
+        if self.use_spec:
+            from nanovllm.spec_decode import NgramProposer, SpeculativeDecoder
+            self.spec_decoder = SpeculativeDecoder(NgramProposer(
+                max_n=config.speculative_ngram_max, k=config.speculative_num_tokens))
         atexit.register(self.exit)
 
     def get_stats(self):
@@ -73,6 +81,7 @@ class EngineCore:
         seq = Sequence(request.prompt_token_ids, request.sampling_params,
                        priority=request.priority)
         seq.request_id = request.request_id
+        seq.grammar = request.grammar   # 引导解码 Grammar（None 表示无约束）
         self.requests[request.request_id] = seq
         self.scheduler.add_request(seq)
 
@@ -90,6 +99,8 @@ class EngineCore:
     def step(self) -> EngineCoreOutputs:
         if self.async_scheduling:
             return self._step_async()
+        if getattr(self, "use_spec", False):
+            return self._step_spec()
         return self._step_sync()
 
     def _step_sync(self) -> EngineCoreOutputs:
@@ -133,6 +144,78 @@ class EngineCore:
 
         return EngineCoreOutputs(outputs=outputs,
                                  num_tokens=self._throughput_hint(sched_output))
+
+    # ── 投机解码：基础步 + 多 token 扩展 ────────────────────────────────────────
+    def _step_spec(self) -> EngineCoreOutputs:
+        """投机解码步：先跑一次普通同步步（推进 prefill / 产 1 个基准 token），再对每个
+        decode 序列做一步**多 token** 投机扩展（propose → verify → reject → 追加接受 token）。
+
+        正常路径（_step_sync）完全不变 → 零回归；spec 仅作为 decode 序列的附加扩展。
+        """
+        base = self._step_sync()
+        if not base.outputs:
+            return base
+        for out in base.outputs:
+            if out.finished:
+                continue
+            seq = self.requests.get(out.request_id)
+            if seq is None or seq.is_prefill:   # 仅对已进入 decode 的序列做投机
+                continue
+            extra, finished, reason = self._extend_with_spec(seq)
+            if extra:
+                out.new_token_ids.extend(extra)
+            if finished:
+                out.finished = True
+                out.finish_reason = reason
+                self.requests.pop(out.request_id, None)
+        return base
+
+    def _extend_with_spec(self, seq):
+        """对一个 decode 序列做一步投机扩展，返回 (接受的额外 token, 是否结束, 结束原因)。"""
+        bm = self.scheduler.block_manager
+        L0 = seq.num_tokens
+        drafts = self.spec_decoder.proposer.propose(seq.token_ids)
+        if not drafts:
+            return [], False, None
+
+        # 1) 投机追加草案 token（分配块，使 verify 的 KV 落点存在）
+        for d in drafts:
+            seq.append_token(d)
+            bm.may_append(seq)
+        # 2) 目标模型并行验证 k+1 个位置（GPU；返回 k+1 个 argmax）
+        targets = self.executor.verify_spec(seq, len(drafts))
+        accepted = self.spec_decoder.rejection_sampler.verify_greedy(drafts, targets)
+
+        # 3) 在接受序列内做 EOS / max_tokens 终止判定（截到首个结束处）
+        final, finished, reason = self._apply_finish(seq, L0, accepted)
+
+        # 4) 回滚到 L0 + final：覆写接受 token 值、释放尾部块（前部块 KV 完好）
+        seq.token_ids = seq.token_ids[:L0] + final
+        seq.num_tokens = L0 + len(final)
+        seq.last_token = seq.token_ids[-1]
+        # 与普通 decode 一致的不变式：最新 token 的 KV 尚未写入（修正位 KV 为草案值/奖励位无 KV）
+        seq.num_cached_tokens = seq.num_tokens - 1
+        bm.truncate_blocks(seq)
+
+        if finished:
+            seq.status = SequenceStatus.FINISHED
+            bm.deallocate(seq)
+            if seq in self.scheduler.running:
+                self.scheduler.running.remove(seq)
+            self.scheduler.finished_req_ids.add(seq.seq_id)
+        return final, finished, reason
+
+    def _apply_finish(self, seq, L0, accepted):
+        """逐个接受 token 判定终止，返回 (截断后的接受序列, 是否结束, 结束原因)。"""
+        result = []
+        for i, tok in enumerate(accepted):
+            result.append(tok)
+            completion = (L0 + i + 1) - seq.num_prompt_tokens
+            if (not seq.ignore_eos and tok == self.scheduler.eos):
+                return result, True, FinishReason.STOP
+            if completion >= seq.max_tokens:
+                return result, True, FinishReason.LENGTH
+        return result, False, None
 
     def _throughput_hint(self, sched_output) -> int:
         """吞吐提示：任一 seq 调度 >1 token 记为含 prefill（正数 token 数），否则纯 decode（负 seq 数）。"""

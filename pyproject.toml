@@ -25,11 +25,18 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-timeout",
+    "httpx",
 ]
 
 gpu = [
     "flash-attn",
     "triton",
+]
+
+serve = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
 ]
 
 [tool.setuptools.packages.find]

@@ -2,8 +2,8 @@
 import torch
 from torch import nn
 
-from nanovllm.layers.attention.common import CommonAttentionMetadata
-from nanovllm.layers.attention.selector import get_attn_backend
+from nanovllm.attention.common import CommonAttentionMetadata
+from nanovllm.attention.selector import get_attn_backend
 
 
 class Attention(nn.Module):

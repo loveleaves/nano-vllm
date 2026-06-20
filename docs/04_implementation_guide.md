@@ -219,15 +219,15 @@ torch.cuda.synchronize()
 | **前缀缓存** | `engine/kv_cache/block_pool.py` | 链式哈希，跨请求复用 KV 块 | prefill 计算量 ↓，相同前缀命中 |
 | **统一连续批 + Chunked Prefill** | `engine/sched/` | decode+prefill chunk 混排，避免 decode 饥饿 | TTFT ↓，TPOT 更平稳 |
 | **持久化 InputBatch** | `engine/input_batch.py` + `block_table.py` | 跨步常驻行 + 增量块表 + 单次切片 H2D | 每步 CPU 构建/H2D ↓ |
-| **FlashAttention（多后端）** | `layers/attention/` | varlen 统一 prefill/decode；registry+能力选择 | HBM 读写 ↓ O(n²→n)，速度 ↑ |
-| **KV 写入 Triton kernel** | `layers/attention/kv_ops.py` | 向量化分散写，slot_mapping，无中间张量 | 显存分配 ↓，写入延迟 ↓ |
+| **FlashAttention（多后端）** | `attention/` | varlen 统一 prefill/decode；registry+能力选择 | HBM 读写 ↓ O(n²→n)，速度 ↑ |
+| **KV 写入 Triton kernel** | `attention/kv_ops.py` | 向量化分散写，slot_mapping，无中间张量 | 显存分配 ↓，写入延迟 ↓ |
 | **CUDA Graph** | `engine/model_runner.py` | 静态 graph replay，Python overhead 归零 | decode 小 batch 延迟 ↓ 50%+ |
 | **torch.compile** | 各 layer | JIT 算子融合，消除中间张量 | elementwise / 归一化速度 ↑ |
 | **Fused Add-RMSNorm** | `layers/layernorm.py` | 合并残差相加 + 归一化 | HBM bandwidth ↓ 50% |
 | **Tensor Parallelism** | `layers/linear.py`, `embed_head.py` | 权重切分 + NCCL all_reduce | 多 GPU 显存 + 算力线性扩展 |
 | **pin_memory + non_blocking** | `engine/block_table.py::CpuGpuBuffer` | H2D 异步传输与 GPU 计算重叠 | PCIe 传输延迟 ↓ |
 | **lru_cache RoPE** | `layers/rotary_embedding.py` | 所有层共享一个 cos_sin_cache | 显存 ↓（N 层 → 1 份缓存） |
-| **结构化采样层** | `layers/sample/` | greedy/top-k/top-p/penalties/logprobs；Gumbel 随机采样向量化 | 功能完整 + 大词表并行 |
+| **结构化采样层** | `sample/` | greedy/top-k/top-p/penalties/logprobs；Gumbel 随机采样向量化 | 功能完整 + 大词表并行 |
 
 ---
 
@@ -335,12 +335,12 @@ torch.cuda.synchronize()
 ### 阶段四：工程优化（按独立性并行推进）
 
 ```
-18. FlashAttention（layers/attention/）
+18. FlashAttention（attention/）
     — 统一 flash_attn_varlen_func 覆盖 prefill 与 decode（decode = query_len 1 的退化）：
       block_table 非 None 即从分页 cache 读历史 KV，无需 with_kvcache 分支
     — 多后端：backend 三件套 + registry（AttentionBackendEnum）+ 能力选择（flash/sdpa）
 
-19. Triton KV 写入（layers/attention/kv_ops.py）
+19. Triton KV 写入（attention/kv_ops.py）
     — store_kvcache_kernel（关键：slot=-1 的处理）；替换 Python scatter
 
 20. Tensor Parallelism（linear.py, embed_head.py, executor/）

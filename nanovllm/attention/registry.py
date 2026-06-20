@@ -25,8 +25,8 @@ _ATTN_OVERRIDES: dict["AttentionBackendEnum", str] = {}
 class AttentionBackendEnum(Enum):
     """所有支持的注意力后端（枚举值为默认实现类路径，可被 register_backend 覆盖）。"""
 
-    FLASH_ATTN = "nanovllm.layers.attention.flash_attn.FlashAttentionBackend"
-    TORCH_SDPA = "nanovllm.layers.attention.torch_sdpa.TorchSDPABackend"
+    FLASH_ATTN = "nanovllm.attention.flash_attn.FlashAttentionBackend"
+    TORCH_SDPA = "nanovllm.attention.torch_sdpa.TorchSDPABackend"
 
     def get_path(self) -> str:
         """该后端的实现类路径（尊重运行时覆盖）。"""

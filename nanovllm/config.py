@@ -36,6 +36,8 @@ class Config:
     num_kvcache_blocks: int = -1
     num_swap_blocks: int = 0   # CPU swap 区块数（>0 时抢占走 swap 而非 recompute；仅 TP=1 内联支持）
     async_scheduling: bool = False   # 异步调度：step N 的 GPU 计算与 step N+1 的 CPU 调度重叠（仅 TP=1 内联，与 swap 互斥）
+    multiproc_engine_core: bool = False   # EngineCore 进程化：调度+执行核心跑在独立子进程（busy-loop + mp.Queue），
+                                          # 前端（tokenize/detokenize/HTTP）与 GPU 调度解耦；默认 False 走同进程 InprocClient
     scheduling_policy: str = "fcfs"
     hf_config: object = field(default=None, repr=False)
     eos: int = -1

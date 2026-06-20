@@ -7,8 +7,8 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.input_batch import InputBatch
 from nanovllm.engine.kv_cache import FullAttentionSpec
-from nanovllm.layers.attention import Attention
-from nanovllm.layers.sample import Sampler, SamplingMetadata
+from nanovllm.attention import Attention
+from nanovllm.sample import Sampler, SamplingMetadata
 from nanovllm.utils.context import AttentionMetadata
 from nanovllm.utils.loader import load_model
 from nanovllm.models.registry import resolve_model_cls

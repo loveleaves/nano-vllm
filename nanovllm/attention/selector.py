@@ -7,8 +7,8 @@ import os
 
 import torch
 
-from nanovllm.layers.attention.backend import AttentionBackend
-from nanovllm.layers.attention.registry import AttentionBackendEnum
+from nanovllm.attention.backend import AttentionBackend
+from nanovllm.attention.registry import AttentionBackendEnum
 
 # 优先级：flash 优于 sdpa（满足能力时优先选 flash）
 _PRIORITY = [AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.TORCH_SDPA]

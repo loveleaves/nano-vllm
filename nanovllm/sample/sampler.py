@@ -9,12 +9,12 @@ nano 子集：不含 bad_words / allowed_token_ids / min_p / logits_processors /
 import torch
 from torch import nn
 
-from nanovllm.layers.sample.metadata import SamplingMetadata
-from nanovllm.layers.sample.outputs import SamplerOutput
-from nanovllm.layers.sample.ops.bad_words import apply_bad_words
-from nanovllm.layers.sample.ops.logprobs import compute_logprobs, gather_logprobs
-from nanovllm.layers.sample.ops.penalties import apply_all_penalties
-from nanovllm.layers.sample.ops.topk_topp import TopKTopPSampler, apply_min_p
+from nanovllm.sample.metadata import SamplingMetadata
+from nanovllm.sample.outputs import SamplerOutput
+from nanovllm.sample.ops.bad_words import apply_bad_words
+from nanovllm.sample.ops.logprobs import compute_logprobs, gather_logprobs
+from nanovllm.sample.ops.penalties import apply_all_penalties
+from nanovllm.sample.ops.topk_topp import TopKTopPSampler, apply_min_p
 
 _SAMPLING_EPS = 1e-5
 

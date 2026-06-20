@@ -2,10 +2,10 @@
 import pytest
 import torch
 
-from nanovllm.layers.sample import Sampler, SamplingMetadata
-from nanovllm.layers.sample.ops.bad_words import apply_bad_words
-from nanovllm.layers.sample.ops.penalties import apply_all_penalties
-from nanovllm.layers.sample.ops.topk_topp import apply_min_p, apply_top_k_top_p, random_sample
+from nanovllm.sample import Sampler, SamplingMetadata
+from nanovllm.sample.ops.bad_words import apply_bad_words
+from nanovllm.sample.ops.penalties import apply_all_penalties
+from nanovllm.sample.ops.topk_topp import apply_min_p, apply_top_k_top_p, random_sample
 
 
 def _greedy_md(n):

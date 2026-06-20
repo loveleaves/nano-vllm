@@ -49,12 +49,12 @@ nanovllm/
 │
 ├── models/qwen3.py       # Qwen3 模型（Attention / MLP / Decoder / 整体）
 │
-├── layers/               # 可复用神经网络层
-│   ├── attention/        # 注意力子系统（backend 三件套 + registry + selector + flash/sdpa + kv_ops）
-│   ├── sample/           # 结构化采样层（metadata + sampler + ops{topk_topp,penalties,logprobs}）
+├── attention/            # 注意力子系统（顶层包，对齐 v1/attention）：backend 三件套 + registry + selector + flash/sdpa + kv_ops
+├── sample/               # 结构化采样层（顶层包，对齐 v1/sample）：metadata + sampler + ops{topk_topp,penalties,logprobs}
+│
+├── layers/               # 可复用纯神经网络层（对齐 model_executor/layers）
 │   ├── linear.py         # 张量并行线性层（Column / Row / QKV / Merged）
-│   ├── rotary_embedding.py / activation.py / layernorm.py / embed_head.py
-│   └── sampler.py        # 垫片 → layers/sample（向后兼容）
+│   └── rotary_embedding.py / activation.py / layernorm.py / embed_head.py
 │
 └── utils/
     ├── context.py        # AttentionMetadata（显式经 forward 链透传，非全局单例）

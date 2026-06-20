@@ -12,7 +12,14 @@ class Config:
       max_num_batched_tokens — 单步最多处理的 token 总数
       max_num_seqs           — 单步最多并发序列数
       max_model_len          — 支持的最大序列长度
-      gpu_memory_utilization — GPU 显存用于 KV cache 的比例
+      device                 — 执行设备："cuda"(GPU，默认) / "cpu"(无 GPU 也能跑，对齐 V1
+                               CpuPlatform + CPUModelRunner)。cpu 下强制 enforce_eager（无
+                               CUDA graph）、仅 TP=1 / UniProc、禁 swap 抢占；模型以 float32
+                               运行（CPU SDPA 对 fp16 支持不全）
+      cpu_kvcache_gb         — device="cpu" 时为 KV cache 预留的内存（GB）。GPU 路径按剩余显存
+                               自动估算块数，CPU 无 mem_get_info，故由此显式给定（对齐 V1
+                               VLLM_CPU_KVCACHE_SPACE）
+      gpu_memory_utilization — GPU 显存用于 KV cache 的比例（仅 device="cuda"）
       tensor_parallel_size   — 张量并行 GPU 数量
       distributed_executor_backend — 执行器后端："uni"(单进程内联) / "mp"(各 rank 子进程隔离)；
                                None 时按 TP 自动选（TP=1→uni，TP>1→mp）。显式 "mp" 可让
@@ -28,6 +35,8 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
+    device: str = "cuda"
+    cpu_kvcache_gb: float = 4.0
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     distributed_executor_backend: str | None = None
@@ -51,6 +60,16 @@ class Config:
         assert self.distributed_executor_backend in (None, "uni", "mp")
         assert 1 <= self.tensor_parallel_size <= 8
         assert 0.0 < self.gpu_memory_utilization <= 1.0
+        assert self.device in ("cuda", "cpu")
+        if self.device == "cpu":
+            # CPU 后端：无 CUDA graph（强制 eager）；TP/进程隔离/swap 抢占均依赖 GPU 语义，限定单进程内联
+            self.enforce_eager = True
+            assert self.tensor_parallel_size == 1, "device='cpu' 仅支持 TP=1"
+            assert self.distributed_executor_backend in (None, "uni"), \
+                "device='cpu' 仅支持 UniProc（不支持 mp 进程隔离）"
+            assert not self.multiproc_engine_core, "device='cpu' 暂不支持 EngineCore 进程化"
+            assert self.num_swap_blocks == 0, "device='cpu' 无 GPU↔CPU swap 概念"
+            assert self.cpu_kvcache_gb > 0, "cpu_kvcache_gb 必须 > 0"
         if self.async_scheduling:
             # 异步调度的 token 前向依赖采样 token 留在 GPU + 单进程内联流水，
             # 暂不支持进程隔离（mp）与 swap 抢占（换出会让在飞 token 张量失效）

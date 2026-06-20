@@ -20,7 +20,7 @@
 | [06_sleep_mode_design.md](06_sleep_mode_design.md) | Sleep Mode 设计分析：CUDA VMM 机制、三级睡眠、分步唤醒、RLHF 用法 |
 | [07_triton_custom_ops.md](07_triton_custom_ops.md) | Triton 定制算子开发指南：编程模型、现有 kernel 解析、SiluAndMul/RMSNorm 示例 |
 
-## 二、V1 架构对齐专题（A–T）
+## 二、V1 架构对齐专题（A–U）
 
 > 把 nano 逐层对齐 vLLM 0.15.1（V1）的设计/取舍/测试记录，每个子目录含 research / design / testing 三件套。
 > research.md 开头均有"## 背景"小节，先讲清该机制**是什么/为何需要/核心思想**，再进入对齐细节。
@@ -45,6 +45,7 @@
 | [arch_engine_proc/](arch_engine_proc/) | **P** EngineCore 进程化（EngineCoreClient：Inproc / MP 子进程 busy-loop，mp.Queue 替 ZMQ） |
 | [arch_logits_guided/](arch_logits_guided/) | **R+S** Logits Processor 框架 + 引导/结构化解码（ChoiceGrammar 逐步 token 掩码，仅 UniProc） |
 | [arch_spec_decode/](arch_spec_decode/) | **T** 投机解码（n-gram proposer + 拒绝采样 + GPU verify + KV 自愈，贪心等价，仅 UniProc） |
+| [arch_cpu_backend/](arch_cpu_backend/) | **U** CPU 执行后端（device 抽象 + CPUModelRunner，中和 CUDA 触点，无 GPU 也能跑） |
 
 ## 三、工程优化专题调研报告（nano-vllm vs vLLM）
 

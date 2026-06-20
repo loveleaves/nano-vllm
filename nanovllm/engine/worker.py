@@ -16,7 +16,12 @@ class Worker:
 
     def __init__(self, config: Config, rank: int = 0):
         self.rank = rank
-        self.model_runner = ModelRunner(config, rank)
+        # 按设备选执行器：CPU 后端用 CPUModelRunner（中和 CUDA 专属操作，对齐 V1 CPUWorker）
+        if config.device == "cpu":
+            from nanovllm.engine.cpu_model_runner import CPUModelRunner
+            self.model_runner = CPUModelRunner(config, rank)
+        else:
+            self.model_runner = ModelRunner(config, rank)
 
     def execute(self, method: str, seqs=None, finished_seq_ids=None):
         """在本 rank 上执行一条指令。"""

@@ -49,13 +49,24 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
 
-        dist.init_process_group("nccl", "tcp://localhost:2333",
-                                world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        # 设备抽象（对齐 V1 CpuPlatform / CPUModelRunner）：device.type 决定是否启用 NCCL /
+        # CUDA graph / 显存估算 / pinned 异步拷贝。is_cuda 为 False 时全部退化到 CPU 同步路径。
+        self.device = torch.device(config.device)
+        self.is_cuda = self.device.type == "cuda"
+        self.pin_memory = self.is_cuda   # pinned 内存依赖 CUDA，CPU 后端关闭
+
+        # TP（NCCL all_reduce）仅在 GPU 多卡需要；CPU 后端限定 TP=1，进程组直接跳过——
+        # 线性/词表层在 dist 未初始化时按 world_size=1 工作（见 layers/linear.py）
+        if self.is_cuda:
+            dist.init_process_group("nccl", "tcp://localhost:2333",
+                                    world_size=self.world_size, rank=rank)
+            torch.cuda.set_device(rank)
 
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
-        torch.set_default_device("cuda")
+        # CPU 上 fp16 的 SDPA / 多数算子支持不全，统一用 fp32（权重 copy_ 时自动转换）
+        run_dtype = hf_config.dtype if self.is_cuda else torch.float32
+        torch.set_default_dtype(run_dtype)
+        torch.set_default_device(self.device)
 
         # 动态解析架构 → 模型类（惰性导入）：从 HF config 的 architectures 字段查注册表，
         # 命中后才 import 对应模块，避免主进程过早初始化 CUDA / 导入全部模型。
@@ -76,13 +87,13 @@ class ModelRunner:
             max_num_reqs=config.max_num_seqs,
             max_num_blocks_per_req=max_num_blocks_per_req,
             max_num_batched_tokens=config.max_num_batched_tokens,
-            block_size=self.block_size, device="cuda", pin_memory=True,
+            block_size=self.block_size, device=self.device, pin_memory=self.pin_memory,
         )
 
         self.warmup_model()
         self.allocate_kv_cache()
 
-        if not self.enforce_eager:
+        if self.is_cuda and not self.enforce_eager:
             self.capture_cudagraph()
 
         torch.set_default_device("cpu")
@@ -94,7 +105,7 @@ class ModelRunner:
         显式释放显存并 empty_cache，使同进程可干净重建引擎（否则残留显存会让下个引擎
         的 num_kvcache_blocks 估算 ≤ 0 而断言失败）。退出后本 runner 不应再被使用。
         """
-        if not self.enforce_eager:
+        if self.is_cuda and not self.enforce_eager:
             del self.graphs, self.graph_pool
         # 解除 Attention 层对 KV cache 切片的引用，再释放 KV cache / 模型 / 输入批缓冲
         for module in self.model.modules():
@@ -107,14 +118,16 @@ class ModelRunner:
         self.input_batch = None
         # nn.Module 间存在引用环，需 gc.collect() 才能释放模型权重显存，否则 empty_cache 无效
         gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        dist.destroy_process_group()
+        if self.is_cuda:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            dist.destroy_process_group()
 
     def warmup_model(self):
-        """运行一次最大批次 prefill，测量 GPU 峰值显存。"""
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        """运行一次最大批次 prefill，测量 GPU 峰值显存（CPU 后端仅跑通前向、不测显存）。"""
+        if self.is_cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
         config = self.config
         seq_len = min(config.max_num_batched_tokens, config.max_model_len)
         num_seqs = min(config.max_num_batched_tokens // seq_len, config.max_num_seqs)
@@ -123,27 +136,36 @@ class ModelRunner:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs)
         self.input_batch.clear()   # 释放 warmup 占用的行，真正推理从空批开始
-        torch.cuda.empty_cache()
+        if self.is_cuda:
+            torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self):
-        """根据剩余显存计算并分配 KV cache 张量（块字节/块数计算由 KVCacheSpec 承担）。"""
+    def _available_kvcache_bytes(self) -> int:
+        """GPU 路径：按 (总显存×利用率 − 已用 − warmup 峰值) 估算可用于 KV cache 的字节数。
+        CPU 后端无 mem_get_info，由 CPUModelRunner 覆写为 config.cpu_kvcache_gb。"""
         config = self.config
-        hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        return int(total * config.gpu_memory_utilization - used - peak + current)
+
+    def allocate_kv_cache(self):
+        """根据可用内存计算并分配 KV cache 张量（块字节/块数计算由 KVCacheSpec 承担）。"""
+        config = self.config
+        hf_config = config.hf_config
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim",
                            hf_config.hidden_size // hf_config.num_attention_heads)
         num_layers = hf_config.num_hidden_layers
 
-        # KVCacheSpec 封装单层单块字节数与"显存 → 块数"反推（对齐 V1）
+        # KVCacheSpec 封装单层单块字节数与"可用内存 → 块数"反推（对齐 V1）。dtype 取运行 dtype
+        # （CPU 后端为 fp32），保证块字节估算与实际 kv_cache 张量一致。
+        kv_dtype = torch.get_default_dtype()
         self.kv_cache_spec = FullAttentionSpec(
             block_size=self.block_size, num_kv_heads=num_kv_heads,
-            head_dim=head_dim, dtype=hf_config.dtype,
+            head_dim=head_dim, dtype=kv_dtype,
         )
-        available = int(total * config.gpu_memory_utilization - used - peak + current)
+        available = self._available_kvcache_bytes()
         config.num_kvcache_blocks = self.kv_cache_spec.num_blocks_for_memory(
             available, num_layers)
         assert config.num_kvcache_blocks > 0
@@ -194,8 +216,10 @@ class ModelRunner:
         self.swap_out(blocks_to_swap_out)
         self.swap_in(blocks_to_swap_in)
 
-    def _to_cuda(self, data, dtype) -> torch.Tensor:
-        return torch.tensor(data, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
+    def _to_device(self, data, dtype) -> torch.Tensor:
+        """构造张量并搬到执行设备。GPU 走 pinned + 异步 H2D；CPU 直接构造（无拷贝）。"""
+        t = torch.tensor(data, dtype=dtype, pin_memory=self.pin_memory)
+        return t.to(self.device, non_blocking=self.pin_memory)
 
     def prepare_sample(self, seqs: list[Sequence]) -> SamplingMetadata:
         """从行序序列构造结构化 SamplingMetadata（仅 rank0 调用）。
@@ -210,17 +234,17 @@ class ModelRunner:
         greedy = [t < eps for t in temps]
         all_greedy = all(greedy)
         all_random = not any(greedy)
-        temperature = self._to_cuda(temps, torch.float32)
+        temperature = self._to_device(temps, torch.float32)
 
         tp = [seq.top_p for seq in seqs]
-        top_p = None if all(x >= 1.0 for x in tp) else self._to_cuda(tp, torch.float32)
+        top_p = None if all(x >= 1.0 for x in tp) else self._to_device(tp, torch.float32)
 
         # top_k：<=0 或 >=vocab 视为关闭，关闭行填 vocab_size（apply_top_k_only 不掩码）
         tk = [k if 0 < k < vocab_size else vocab_size for k in (seq.top_k for seq in seqs)]
-        top_k = None if all(k == vocab_size for k in tk) else self._to_cuda(tk, torch.int32)
+        top_k = None if all(k == vocab_size for k in tk) else self._to_device(tk, torch.int32)
 
         mp = [seq.min_p for seq in seqs]
-        min_p = None if all(x <= 0.0 for x in mp) else self._to_cuda(mp, torch.float32)
+        min_p = None if all(x <= 0.0 for x in mp) else self._to_device(mp, torch.float32)
 
         freq = [seq.frequency_penalty for seq in seqs]
         pres = [seq.presence_penalty for seq in seqs]
@@ -239,9 +263,9 @@ class ModelRunner:
         if not no_penalties:
             prompt_ids = [seq.prompt_token_ids for seq in seqs]
             output_ids = [seq.completion_token_ids for seq in seqs]
-            freq_t = self._to_cuda(freq, torch.float32)
-            pres_t = self._to_cuda(pres, torch.float32)
-            rep_t = self._to_cuda(rep, torch.float32)
+            freq_t = self._to_device(freq, torch.float32)
+            pres_t = self._to_device(pres, torch.float32)
+            rep_t = self._to_device(rep, torch.float32)
         elif bad_words is not None:
             output_ids = [seq.completion_token_ids for seq in seqs]
 
@@ -252,7 +276,7 @@ class ModelRunner:
                 continue
             gen = self.generators.get(seq.seq_id)
             if gen is None:
-                gen = torch.Generator(device="cuda")
+                gen = torch.Generator(device=self.device)
                 gen.manual_seed(seq.seed)
                 self.generators[seq.seq_id] = gen
             generators[row] = gen
@@ -332,7 +356,7 @@ class ModelRunner:
         bt = seq.block_table
         slots = [bt[p // block_size] * block_size + (p % block_size) for p in positions]
 
-        dev = "cuda"
+        dev = self.device
         input_ids = torch.tensor(seq.token_ids[start:n_kv], dtype=torch.int64, device=dev)
         pos_t = torch.tensor(positions, dtype=torch.int64, device=dev)
         attn_md = AttentionMetadata(

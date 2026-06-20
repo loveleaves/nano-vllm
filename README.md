@@ -33,8 +33,11 @@ EngineCore 进程化、Logits Processor 框架 + 引导解码、投机解码)。
 - 🧱 **Logits Processor 框架 + 引导解码**:`sample/logits_processor/` 可插拔列表(penalties / bad_words / logit_bias / min_tokens),`sample/guided/` 以 `ChoiceGrammar` 逐步 token 掩码约束输出为候选集之一(`guided_choice`)
 - 🔮 **投机解码**:`spec_decode/` n-gram proposer 提议草稿 + `sample/rejection_sampler` 拒绝采样 + GPU 一次性 verify + KV 自愈,贪心等价、零回归门控(`speculative_num_tokens`,仅 UniProc)
 - 🔥 **torch.compile**:Fused Add-RMSNorm 编译融合
+- 💻 **CPU 执行后端**:`device="cpu"` 即可**无 GPU 跑通完整推理**(对齐 V1 CpuPlatform /
+  CPUModelRunner):中和 NCCL / CUDA graph / pinned 内存 / 显存估算等 CUDA 触点,注意力走 SDPA、
+  KV 写入走 naive scatter、统一 fp32;KV cache 内存由 `cpu_kvcache_gb` 预留(见 `example_cpu.py`)
 - ✅ **CPU 可测**:flash-attn / Triton 为可选依赖,不可用时退回 SDPA / Python scatter,
-  338 个单元测试无 GPU 即可运行
+  346 个单元测试无 GPU 即可运行
 
 ## 安装
 
@@ -85,6 +88,7 @@ print(outputs[0]["text"])
 python example.py          # 同步批量生成
 python example_async.py    # AsyncLLM 异步流式
 python example_server.py   # OpenAI 兼容 API 服务
+python example_cpu.py      # 无 GPU(device="cpu")跑通完整推理
 ```
 
 ### OpenAI 兼容服务
@@ -109,7 +113,9 @@ curl -N http://localhost:8000/v1/chat/completions -H 'Content-Type: application/
 | `max_num_batched_tokens` | 16384 | 单步最多处理的 token 总数 |
 | `max_num_seqs` | 512 | 单步最多并发序列数 |
 | `max_model_len` | 4096 | 最大序列长度(自动截断到模型上限) |
-| `gpu_memory_utilization` | 0.9 | 显存利用率,剩余部分全部分配给 KV cache |
+| `device` | `"cuda"` | 执行设备:`"cuda"`(GPU)/`"cpu"`(无 GPU 也能跑;强制 eager、仅 TP=1/UniProc、统一 fp32) |
+| `cpu_kvcache_gb` | 4.0 | `device="cpu"` 时为 KV cache 预留的内存(GB);GPU 路径按剩余显存自动估算 |
+| `gpu_memory_utilization` | 0.9 | 显存利用率,剩余部分全部分配给 KV cache(仅 `device="cuda"`) |
 | `tensor_parallel_size` | 1 | 张量并行 GPU 数(1–8) |
 | `scheduling_policy` | `"fcfs"` | waiting 队列排队策略:`"fcfs"` 或 `"priority"` |
 | `distributed_executor_backend` | `None` | 执行器后端:`None`(按 TP 自动)/ `"uni"`(单进程内联)/ `"mp"`(各 rank 子进程隔离) |
@@ -140,7 +146,7 @@ EngineCore.step()                       持 Scheduler + Executor,产 EngineCoreO
 
 注意力元数据 `AttentionMetadata` 经 forward 链**显式透传**(非全局单例)。详细架构与数据流见
 [docs/01_architecture.md](docs/01_architecture.md)、[docs/03_data_flow.md](docs/03_data_flow.md);
-各 V1 对齐轮次(A–T)的 research/design/testing、工程优化调研报告、模型适配文档的完整索引见
+各 V1 对齐轮次(A–U)的 research/design/testing、工程优化调研报告、模型适配文档的完整索引见
 [docs/README.md](docs/README.md)。
 
 ## 实现阶段
@@ -168,12 +174,12 @@ EngineCore.step()                       持 Scheduler + Executor,产 EngineCoreO
 | `phase4` | Phase 4 工程优化(已并入) |
 | `phase5` | 对齐 vLLM V1 分层骨架(A–L,见上表) |
 | `phase6` | 增强与广度对齐(M–Q:增强项 / 模型注册表 / 服务入口 / EngineCore 进程化 / 目录合理化) |
-| `phase7` | **当前开发分支**:R+S Logits Processor 框架 + 引导/结构化解码 · T 投机解码(n-gram + 拒绝采样 + GPU verify + KV 自愈) |
+| `phase7` | **当前开发分支**:R+S Logits Processor 框架 + 引导/结构化解码 · T 投机解码(n-gram + 拒绝采样 + GPU verify + KV 自愈) · U CPU 执行后端(device 抽象,无 GPU 也能跑) |
 
 ## 测试
 
 ```bash
-pytest -m unit    # 单元测试,纯 CPU,无需 GPU(338 个)
+pytest -m unit    # 单元测试,纯 CPU,无需 GPU(346 个)
 pytest -m gpu     # 集成测试,需要 CUDA GPU 和模型权重
 ```
 
@@ -191,7 +197,7 @@ nanovllm/
 │   ├── sched/        # 调度器子包(interface / output / request_queue / scheduler)
 │   ├── kv_cache/     # KV cache 三层(block_pool / kv_cache_manager / interface)
 │   ├── executor/     # Executor 抽象(abstract / uniproc / multiproc)
-│   ├── worker / rpc / input_batch / block_table / model_runner / sequence / metrics
+│   ├── worker / rpc / input_batch / block_table / model_runner / cpu_model_runner / sequence / metrics
 │   └── scheduler.py / block_manager.py   # 向后兼容垫片
 ├── attention/                       # 注意力子系统(顶层包,对齐 v1/attention)
 │   └── backend 三件套 + registry + selector + flash/sdpa + kv_ops + layer

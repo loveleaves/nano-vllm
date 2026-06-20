@@ -37,7 +37,10 @@ class Sampler(nn.Module):
         if num_logprobs is not None:
             raw_logprobs = compute_logprobs(logits)
 
-        logits = logits.float()
+        # copy=True 强制拷出普通可写张量：模型前向在 inference_mode 下产出的是 inference
+        # tensor，后续 LogitsProcessor / 温度缩放需就地改写。GPU 上 bf16→fp32 本就拷贝，
+        # CPU 上 logits 已是 fp32，.float() 会原样返回（仍是 inference tensor）故须显式 copy。
+        logits = logits.to(torch.float32, copy=True)
         for processor in self.logits_processors:
             logits = processor.apply(logits, sampling_metadata)
 

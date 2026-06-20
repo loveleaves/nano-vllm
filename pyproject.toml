@@ -18,6 +18,7 @@ dependencies = [
     "xxhash",
     "numpy",
     "tqdm",
+    "msgspec",
 ]
 
 [project.optional-dependencies]

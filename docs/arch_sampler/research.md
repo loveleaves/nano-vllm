@@ -2,6 +2,24 @@
 
 > 对照基准：本机 `/home/cb/work/vllm/vllm` @ tag `v0.15.1`（V1 架构）。
 
+## 背景：采样层做什么
+
+模型前向产出每个位置在词表上的 **logits**（未归一化分数）；采样层负责把 logits 变成下一个
+token。这一步决定了输出的确定性与多样性，常见控制项：
+
+- **temperature**：缩放 logits。0 = greedy（取 argmax，确定性）；越大越随机。
+- **top-k / top-p（核采样）/ min-p**：截断候选集——只在概率最高的 k 个 / 累积概率 p 内 / 不低于
+  峰值 min_p 倍的 token 里随机抽，避免抽到长尾垃圾 token。
+- **惩罚（presence/frequency/repetition）**：对已出现 token 扣分，抑制重复啰嗦。
+- **logprobs**：返回每步 top-k token 的对数概率（可解释性 / 打分）。
+- **seed**：固定随机数发生器，使随机采样可复现。
+
+**核心思想——结构化 + 向量化**：把"本批每个序列的采样配置"固化成 `SamplingMetadata`（按行批
+持有各参数），Sampler 一次性**向量化**处理整批（greedy 行取 argmax、随机行走温度+截断采样，用
+`where` 按行选择）——而非逐序列 Python 循环。整批无某项配置时该项整段跳过（快速路径）。
+
+**作用**：从"只支持温度+Gumbel"的玩具采样升级为生产级、可组合、批级高效的真采样层。
+
 ## V1 `v1/sample/` 组件
 
 | 文件 | 职责 | nano 对应 |

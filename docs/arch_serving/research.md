@@ -4,6 +4,23 @@
 > 起点：nano-vllm 仅有 `LLM.generate()`（同步）与 `AsyncLLM.generate()`（异步生成器），
 > **无 HTTP 服务入口**——是全局对比文档标注的"广度差距"之一。本轮（O）补 OpenAI 兼容 server。
 
+## 背景：什么是服务入口（OpenAI 兼容 API server）
+
+**问题**：`LLM.generate()` 是**库**调用——同进程、阻塞、单机本地。要把推理引擎当**服务**对外提供
+（多客户端、HTTP、流式），需要一层 HTTP 入口把网络请求翻译成引擎调用。
+
+**核心思想——OpenAI 兼容 + 三件套分层**：复刻 OpenAI 的 REST 协议（`/v1/completions`、
+`/v1/chat/completions`、`/v1/models`），现有 OpenAI 客户端/生态可零改动接入。每个端点分三层：
+- **protocol**：Pydantic 请求/响应模型（OpenAI schema）+ 采样参数映射到 SamplingParams。
+- **serving**：把请求翻译成对 `AsyncLLM.generate` 的调用，再把流式产出组装成响应。
+- **api_server**：FastAPI app + 路由 + lifespan（持引擎）+ uvicorn 启动。
+
+**流式（SSE）**：chat/completions 支持 `stream=true`，用 Server-Sent Events 逐块下发
+（`data: {json}\n\n` … `data: [DONE]`），客户端实时拿到增量文本（delta）。
+
+**作用 / 收益**：让 nano 从"库"变成可被任意 OpenAI 客户端调用的"服务"；复用同进程 AsyncLLM 的连续
+批与流式（每个 HTTP 请求 = 一次 AsyncLLM.generate，后台 handler 把它们混排进同一批）。
+
 ## vLLM 服务入口结构
 
 ```

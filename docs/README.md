@@ -2,8 +2,8 @@
 
 本目录文档分五类：**核心实现文档**、**V1 架构对齐专题**、**工程优化调研报告**、**模型适配专题**、**通用参考**。
 
-> `phase5` 分支已按 vLLM 0.15.1（V1 架构）逐层对齐分层骨架（轮次 A–L）。读架构请先看
-> [01_architecture.md](01_architecture.md) 与 [nano_vs_vllm-架构对比](nano_vs_vllm-架构对比-20260618.md)，
+> `phase5/phase6` 分支已按 vLLM 0.15.1（V1 架构）逐层对齐分层骨架（轮次 A–T）。读架构请先看
+> [01_architecture.md](01_architecture.md) 与 [nano_vs_vllm-架构对比](nano_vs_vllm-架构对比-20260620.md)，
 > 各对齐轮次的 research/design/testing 见下方"二"。
 
 ## 一、核心实现文档
@@ -20,13 +20,14 @@
 | [06_sleep_mode_design.md](06_sleep_mode_design.md) | Sleep Mode 设计分析：CUDA VMM 机制、三级睡眠、分步唤醒、RLHF 用法 |
 | [07_triton_custom_ops.md](07_triton_custom_ops.md) | Triton 定制算子开发指南：编程模型、现有 kernel 解析、SiluAndMul/RMSNorm 示例 |
 
-## 二、V1 架构对齐专题（A–L）
+## 二、V1 架构对齐专题（A–T）
 
 > 把 nano 逐层对齐 vLLM 0.15.1（V1）的设计/取舍/测试记录，每个子目录含 research / design / testing 三件套。
+> research.md 开头均有"## 背景"小节，先讲清该机制**是什么/为何需要/核心思想**，再进入对齐细节。
 
 | 文档 | 对齐内容 |
 |------|------|
-| [nano_vs_vllm-架构对比](nano_vs_vllm-架构对比-20260618.md) | **全局对比**（A–L 后）：逐子系统"已对齐 / 仍有差距"，建议先读 |
+| [nano_vs_vllm-架构对比](nano_vs_vllm-架构对比-20260620.md) | **全局对比**（A–T 后）：逐子系统"已对齐 / 仍有差距"，建议先读 |
 | [arch_alignment/](arch_alignment/) | **A+B** 统一连续批调度 + 显式 AttentionMetadata |
 | [arch_backend_worker/](arch_backend_worker/) | **C+D** 多后端 AttentionBackend 抽象 + Worker/RPC 解耦 |
 | [arch_engine/](arch_engine/) | **E** 引擎层组件拆分（Processor/EngineCore/OutputProcessor）+ AsyncLLM 异步通路 |
@@ -37,6 +38,13 @@
 | [arch_sampler/](arch_sampler/) | **J** 结构化采样层（SamplingMetadata + Sampler + ops：greedy/top-k/top-p/penalties/logprobs） |
 | [arch_worker_isolation/](arch_worker_isolation/) | **K** Worker/Executor 进程隔离（rank0 也进子进程 + ResultChannel 回传 + 块数 RPC） |
 | [arch_attn_registry/](arch_attn_registry/) | **L** Attention 后端注册表 + 能力选择（AttentionBackendEnum + register_backend） |
+| [arch_async/](arch_async/) | **M#4** 异步调度（async_scheduling，占位 token + 采样留 GPU，跨步前向重叠，仅 UniProc） |
+| [arch_swap/](arch_swap/) | **M#5** Swap 抢占（CPU↔GPU 块换入换出，num_swap_blocks 门控，仅 UniProc） |
+| [arch_model_registry/](arch_model_registry/) | **N** 动态模型注册表 + 惰性加载（架构名 → 模型类，importlib 按需导入） |
+| [arch_serving/](arch_serving/) | **O** 服务入口（OpenAI 兼容 API server，FastAPI + SSE 流式，复用同进程 AsyncLLM） |
+| [arch_engine_proc/](arch_engine_proc/) | **P** EngineCore 进程化（EngineCoreClient：Inproc / MP 子进程 busy-loop，mp.Queue 替 ZMQ） |
+| [arch_logits_guided/](arch_logits_guided/) | **R+S** Logits Processor 框架 + 引导/结构化解码（ChoiceGrammar 逐步 token 掩码，仅 UniProc） |
+| [arch_spec_decode/](arch_spec_decode/) | **T** 投机解码（n-gram proposer + 拒绝采样 + GPU verify + KV 自愈，贪心等价，仅 UniProc） |
 
 ## 三、工程优化专题调研报告（nano-vllm vs vLLM）
 

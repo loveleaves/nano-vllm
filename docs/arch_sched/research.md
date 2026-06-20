@@ -2,6 +2,23 @@
 
 > 对照基准：本机 `/home/cb/work/vllm/vllm` @ tag `v0.15.1`（V1 架构）。
 
+## 背景：调度器做什么
+
+**职责**：每一步推理前，调度器从"等待队列 + 运行队列"里挑出本步要喂给 GPU 的序列与各自的
+token 数，受三重预算约束：最大并发序列数、单步最大 token 数、KV 显存（块）是否够分配。它是
+吞吐与延迟的总开关。
+
+**核心思想——统一连续批（continuous batching）**：不再分"先 prefill 一批、再 decode 一批"的阶段，
+而是每步把 decode（每序列 1 个新 token）与 prefill（新请求的 prompt，可分块）**混排进同一个变长
+（varlen）批**。一个序列生成完即时让出名额、新请求即时补入——GPU 利用率持续打满，而非等整批
+对齐。decode 显存不足时按策略**抢占**（换出/重算）。
+
+**作用 / 收益**：高吞吐、低排队延迟、平稳的显存占用；可插拔排队策略（FCFS / 优先级）。
+
+**子包结构（本轮对齐 V1）**：`interface`(ABC) + `output`(结构化 SchedulerOutput) +
+`request_queue`(FCFS/Priority 队列) + `scheduler`(算法主体：decode 优先 → prefill 填剩余预算 →
+预算不足则抢占)。
+
 ## V1 调度器子包（`vllm/v1/core/sched/`）
 
 | 文件 | 职责 | nano 对应 |

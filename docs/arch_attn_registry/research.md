@@ -5,6 +5,23 @@
 > 两处差距——① 无 `registry.py` 动态注册 + 按 head_dim/dtype/platform 自动选最优后端；
 > ② builder 恒等（V1 各后端 builder 做实质重排）。本轮补齐 ①。
 
+## 背景：什么是注意力后端注册表 + 能力选择
+
+**问题**：注意力有多种实现（后端）——FlashAttention（最快，但要求特定 head_size/dtype/有 CUDA +
+装了 flash-attn）、PyTorch SDPA（兜底，任意平台/精度）等。它们性能与适用范围各异，硬编码"二选一"
+不可扩展、不可按环境自适应。
+
+**核心思想——注册表 + 能力驱动选择**：
+- **注册表**：用枚举把"后端名 → 实现类路径"登记成表，`get_class()` **惰性导入**（用时才 import，
+  避免无谓依赖）；`register_backend` 可运行时覆盖（接第三方后端 / 测试替身）。
+- **能力查询**：每个后端声明自己支持的 `head_size / dtype / 平台`（`is_available` /
+  `supports_head_size` / `supports_dtype`）。
+- **自动选择**：`get_attn_backend(head_size, dtype, device)` 按优先级 [flash, sdpa] 选出第一个
+  "可用且支持当前形状/精度"的后端；环境变量可显式强制。
+
+**作用 / 收益**：按硬件/模型自适应选最优后端，新增后端只需注册一行，CPU/无 flash-attn 环境自动
+回退 SDPA（保证可测）。
+
 ## V1 组件
 
 | 文件 | 职责 | nano 对应 |

@@ -171,7 +171,14 @@ class EngineCore:
         return base
 
     def _extend_with_spec(self, seq):
-        """对一个 decode 序列做一步投机扩展，返回 (接受的额外 token, 是否结束, 结束原因)。"""
+        """对一个 decode 序列做一步投机扩展，返回 (接受的额外 token, 是否结束, 结束原因)。
+
+        KV 自愈（为何无需显式回滚 KV）：verify 在位置 L0..L0+k-1 写入草案 token 的 KV。
+        被接受的匹配位（草案==目标）KV 正确；唯一可能"脏"的是最后那个 token——修正位的 KV 是
+        草案值（错）、或奖励位根本没写 KV。但我们把 num_cached 设为 num_tokens-1，即把"最新
+        token"标记为"KV 未就绪"，下一步前向它时会**覆写**成正确 KV——这与普通 decode 中"刚生成
+        的 token 其 KV 要等下一步才写"完全一致。故只需释放尾部多余块（前部块 KV 不动）即可。
+        """
         bm = self.scheduler.block_manager
         L0 = seq.num_tokens
         drafts = self.spec_decoder.proposer.propose(seq.token_ids)

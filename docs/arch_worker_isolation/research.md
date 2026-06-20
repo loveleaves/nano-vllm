@@ -3,6 +3,23 @@
 > 对照基准：本机 `/home/cb/work/vllm/vllm` @ tag `v0.15.1`（V1 架构）。
 > 承接 H 轮（Executor 抽象）遗留项：H 明确把"rank0 也进子进程"列为**未做**，本轮补齐。
 
+## 背景：为什么 rank0 也要进子进程
+
+**问题**：TP 多进程下，H 轮让 rank1..N-1 进子进程，但 **rank0 仍内联在引擎进程**里。这导致引擎
+进程也要初始化 CUDA / 进 NCCL 组，与"前端保持 CUDA-free、各 rank 对称"的理想相悖，也使
+fork/spawn、信号处理、异常传播变复杂。
+
+**核心思想——所有 rank 对称隔离**：让 **rank0 也进独立子进程**，引擎进程不内联任何 Worker、不进
+NCCL 组，只通过两条共享内存通道与 Worker 群通信：
+- `ShmTransport`：引擎 → 各 Worker 的**广播**（下发"跑一步"指令 + 序列化的输入）。
+- `ResultChannel`：输出 rank（rank0）→ 引擎的**回传**（采样出的 token / 块数等）。
+
+**核心思想——共享内存替代 ZMQ**：vLLM 用 ZMQ；nano 用 stdlib `SharedMemory + Event` + msgspec
+序列化达到同等"进程隔离 + 结构化消息"，更轻、无额外依赖。
+
+**作用 / 收益**：各 rank 对称、引擎进程 CUDA-free；`distributed_executor_backend="mp"` 让单卡也能
+跑进程隔离（便于在单 GPU 上测试隔离机制，无需多卡）。
+
 ## V1 `MultiprocExecutor` 关键结构
 
 | 元素 | 职责 |

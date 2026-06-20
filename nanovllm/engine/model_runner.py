@@ -321,10 +321,13 @@ class ModelRunner:
         [token@(L0-1), 草案0..草案k-1]（k+1 个位置），写入它们的 KV（被拒绝位的 KV 由后续
         步覆盖），并对**全部** k+1 个位置取 lm_head（不做末位聚合）后 argmax。
         """
+        # 位置算术：调用前已把 k 个草案 append 到 seq，故 num_tokens = L0 + k（L0=投机前长度）。
+        # 要预测位置 L0..L0+k（共 k+1 个），需以位置 L0-1..L0+k-1 的 token 作为 query 前向：
+        #   query[0]=原最后一个真 token(位置 L0-1) → 预测 L0；query[1..k]=草案(位置 L0..L0+k-1) → 预测 L0+1..L0+k
         k = num_drafts
         n_kv = seq.num_tokens                       # = L0 + k（已含草案）
-        start = n_kv - (k + 1)                      # L0 - 1
-        positions = list(range(start, n_kv))        # k+1 个 query 位置
+        start = n_kv - (k + 1)                      # L0 - 1：最后一个真 token 的位置
+        positions = list(range(start, n_kv))        # k+1 个 query 位置：L0-1 .. L0+k-1
         block_size = self.block_size
         bt = seq.block_table
         slots = [bt[p // block_size] * block_size + (p % block_size) for p in positions]

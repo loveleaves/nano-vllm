@@ -4,6 +4,22 @@
 > ——**swap（KV 块换出到 CPU pinned 内存，恢复时换回 GPU、续算 decode）**，作为可选项
 > （`num_swap_blocks > 0` 开启）。
 
+## 背景：什么是抢占，swap vs recompute
+
+**问题**：连续批运行中，正在 decode 的序列不断增长、要不断分配新 KV 块。当显存（块）耗尽、又有
+新序列要进来或老序列要续算时，必须**抢占**——临时让出某些序列占用的 KV 块，等显存宽裕再恢复。
+
+**两条恢复路径**：
+- **recompute（重算）**：直接丢弃被抢占序列的 KV，恢复时把它当新请求**重新 prefill**。实现简单、
+  零额外显存，但浪费已算过的前向（prompt 长时代价大）。nano 原有的唯一策略。
+- **swap（换出）**：把被抢占序列的 KV 块从 GPU **拷到 CPU pinned 内存**（换出 D2H），恢复时再拷回
+  GPU（换入 H2D）、从断点**续算 decode**。省去重算，但需 CPU 暂存区与 H2D/D2H 拷贝。
+
+**核心思想**：用 CPU 内存当 GPU KV 的"交换区"（类比操作系统的 swap 分区），以带宽换算力。
+
+**作用 / 收益**：长 prompt、高并发抢占频繁时，swap 比 recompute 省大量重复 prefill。
+**边界**：本实现仅 UniProc，门控 `num_swap_blocks>0`（默认 0 → 仍走 recompute，零回归）。
+
 ## V1 的抢占设计
 
 vLLM V1 `v1/core/sched/scheduler.py` 在 decode 步显存不足时抢占 running 序列。两种回收方式：

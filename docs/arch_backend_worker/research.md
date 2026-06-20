@@ -2,6 +2,19 @@
 
 > 承接 `docs/arch_alignment` 的 A+B 成果。参照 vLLM 0.15.1 (V1)，本地检出 `/home/cb/work/vllm/vllm`。
 
+## 背景：多后端 Attention 抽象（C） + Worker/RPC 解耦（D）
+
+**C — 多后端 Attention 抽象**：把写死的 FlashAttention 调用抽象成 `AttentionBackend` 接口
+（backend / impl / metadata-builder 三件套），不同实现（FlashAttn / SDPA）遵循统一契约，可按平台
+能力切换、可在无 GPU/无 flash-attn 时回退 SDPA（让逻辑 CPU 可测）。
+
+**D — Worker / RPC 解耦**：原 ModelRunner 既管 GPU 执行、又管多进程通信（共享内存广播、barrier），
+职责纠缠。D 把"进程间通信"抽到独立的 `Worker`（单 rank 执行）+ `ShmTransport`（共享内存 RPC 传输，
+用 msgspec 结构化序列化替代裸 pickle），ModelRunner 瘦身为**纯 GPU 执行器**。
+
+**核心思想**：用接口隔离"算什么"（attention 后端）与"在哪算/怎么传"（执行器 vs 通信），各自可
+独立演进与测试——这是后续 Executor 抽象（H）、进程隔离（K）的地基。
+
 ## 摘要
 
 V1 的 attention 分层（C）是三层抽象：

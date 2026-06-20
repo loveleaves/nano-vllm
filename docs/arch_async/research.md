@@ -3,6 +3,22 @@
 > 目标：让 step N 的 GPU 计算与 step N+1 的 CPU 调度/输入构造**重叠**，吃掉每步之间
 > CPU 侧（schedule / make_inputs / 采样后处理）的气泡。门控 `Config.async_scheduling`。
 
+## 背景：什么是异步调度
+
+**问题**：一步推理 = CPU 工作（调度选序列、构造输入张量、采样后处理）+ GPU 工作（模型前向）。
+若严格串行，GPU 在每步 CPU 工作期间**空转**，这些"气泡"在小模型/小批时占比可观。
+
+**核心思想——流水重叠（深度 1）**：在把 step N 的前向**非阻塞**下发 GPU 后，不等它的结果，先去
+做 step N+1 的 CPU 调度；待 N+1 也下发后，再回收 N 的结果。于是"N 的 GPU 计算"与"N+1 的 CPU
+调度"在时间上重叠。
+
+**难点——token 依赖**：step N+1 的输入需要 step N 采样出的 token，但我们故意不等它（不做 D2H
+同步）。解法：①采样 token **留在 GPU**，下一步前向直接用 GPU 上的张量回填，不回 CPU；②序列长度
+用**占位 token** 提前推进（让调度/块分配算对位置），真实值待结果返回时回填。
+
+**作用 / 收益**：吃掉步间 CPU 气泡；`async == sync` 逐 token 一致（只调时序、不改结果）。
+**代价/边界**：仅 UniProc（采样张量须留同进程 GPU），与 swap 互斥（换出会让在飞张量失效）。
+
 ## V1 的设计
 
 vLLM V1 `v1/engine/core.py::step()` 在 `async_scheduling=True` 时：

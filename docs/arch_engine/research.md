@@ -2,6 +2,23 @@
 
 > 对照基准：本机 `/home/cb/work/vllm/vllm` @ tag `v0.15.1`（V1 架构）。
 
+## 背景：为什么把引擎拆成多个组件
+
+**问题**：单体 LLMEngine 把"输入 tokenize、调度执行、输出 detokenize、停止判定、流式"全揉在一起，
+难测试、难复用、难做异步。
+
+**核心思想——按职责分层（对齐 V1）**，每段是可独立测试的组件，靠显式数据契约（dataclass）相连：
+```
+Processor        输入处理：文本 → token → EngineCoreRequest
+EngineCore       调度 + 执行循环：持 Scheduler + Executor，产 EngineCoreOutputs（只含 token，不含文本）
+OutputProcessor  输出处理：增量 detokenize、停止串匹配、finish reason → RequestOutput（面向用户）
+Detokenizer      增量解码（token → 文本片段）
+AsyncLLM         异步流式入口（async generator，逐步 yield 增量）
+```
+
+**作用 / 收益**：各段独立演进/单测；EngineCore 不碰文本、Processor/OutputProcessor 不碰 GPU；
+为异步流式（AsyncLLM）与后续 EngineCore 进程化（P）铺好边界。
+
 ## V1 引擎层组件（`vllm/v1/engine/`）
 
 | 文件 | 职责 | nano 对应 |

@@ -44,7 +44,10 @@ class ChoiceGrammar(Grammar):
     def allowed_token_ids(self) -> set[int] | None:
         if self._done:
             return {self.eos_token_id}
+        # 可延伸候选的下一个 token：均允许
         allowed = {toks[pos] for toks, pos in self.candidates if pos < len(toks)}
+        # 若已有候选恰好匹配完整（pos 到末尾），则额外允许 EOS——这样能同时支持"互为前缀"的
+        # 候选（如 ["a","ab"]：匹配到 a 后，既可发 EOS 结束于 "a"，也可发 b 继续走向 "ab"）。
         if self._complete_available():
             allowed.add(self.eos_token_id)
         return allowed

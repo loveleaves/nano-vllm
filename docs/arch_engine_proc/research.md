@@ -5,6 +5,28 @@
 > generate 循环同进程驱动 `EngineCore.step()`；进程隔离只到 Worker 层（K 轮）。这是
 > 全局对比标注的"最根本区别：进程拓扑"。本轮（P）补 EngineCore 独立进程。
 
+## 背景：什么是 EngineCore 进程化（进程拓扑）
+
+**问题**：把 tokenize / detokenize / HTTP 序列化（CPU、可能慢）和 GPU 调度执行放在**同一进程**时，
+前者会阻塞后者——一个慢请求的文本处理拖累整个 GPU 调度循环；且前端进程被迫初始化 CUDA。
+
+**核心思想——三级进程拓扑**：把系统拆成跨进程的三层，各自独立伸缩：
+```
+前端进程        Processor(tokenize) / OutputProcessor(detokenize) / HTTP —— 不碰 GPU
+   │  队列收发（请求/产出）
+EngineCore 进程  busy-loop：Scheduler + Executor —— GPU 调度循环，不被前端阻塞
+   │  广播/回传
+Worker 进程 × N  各 rank 模型前向
+```
+EngineCore 跑在独立子进程，自带 busy-loop（空闲阻塞等请求、有活则每步调度执行并回传产出）；
+前端只"提交请求 / 收产出"，不再驱动每一步。
+
+**核心思想——客户端抽象**：用 `EngineCoreClient` 屏蔽"核心在不在本进程"——`InprocClient`（同进程，
+直接驱动 step，零回归默认）/ `MPClient`（独立子进程，经队列收发）。传输用 stdlib
+`multiprocessing.Queue` 替代 vLLM 的 ZMQ。
+
+**作用 / 收益**：前端与 GPU 调度解耦、前端保持 CUDA-free；具备 V1"前后端解耦内核"的拓扑骨架。
+
 ## V1 进程拓扑
 
 ```

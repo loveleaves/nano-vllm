@@ -16,8 +16,7 @@ _PRIORITY = [AttentionBackendEnum.FLASH_ATTN, AttentionBackendEnum.TORCH_SDPA]
 
 def get_attn_backend(head_size: int | None = None,
                      dtype: torch.dtype | None = None,
-                     device_type: str | None = None,
-                     is_cuda: bool | None = None) -> type[AttentionBackend]:
+                     device_type: str | None = None) -> type[AttentionBackend]:
     """选择注意力后端。
 
     1. `NANOVLLM_ATTN_BACKEND={flash_attn,torch_sdpa}` → 显式强制（绕过能力筛选）。
@@ -25,17 +24,15 @@ def get_attn_backend(head_size: int | None = None,
        ∧ supports_dtype) 的后端。head_size/dtype 为 None 时跳过对应检查。
     3. 均不满足 → ValueError。
 
-    device_type 未给时由 is_cuda（向后兼容旧签名）或当前默认设备推断。
-    后端在 Attention.__init__ 绑定，故以**当前默认设备/dtype**判定，graph 捕获期不再分发。
+    device_type 未给时由当前默认设备推断。后端在 Attention.__init__ 绑定，故以
+    **当前默认设备/dtype**判定，graph 捕获期不再分发。
     """
     forced = os.getenv("NANOVLLM_ATTN_BACKEND")
     if forced:
         return AttentionBackendEnum.from_name(forced).get_class()
 
     if device_type is None:
-        if is_cuda is None:
-            is_cuda = torch.get_default_device().type == "cuda"
-        device_type = "cuda" if is_cuda else "cpu"
+        device_type = torch.get_default_device().type
 
     for member in _PRIORITY:
         backend = member.get_class()

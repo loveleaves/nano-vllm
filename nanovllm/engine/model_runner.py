@@ -62,6 +62,9 @@ class ModelRunner:
         self.sampler = Sampler()
         # 按请求 seed 持久化的随机数生成器（seq_id → Generator），跨步续流
         self.generators: dict[int, torch.Generator] = {}
+        # 异步调度的两槽采样状态：inflight=上一步（待回收 + 本步前向源）/ pending=本步刚算出
+        self._ai = None   # dict(sampled[GPU], ordered, index{seq_id→row}, logprobs) | None
+        self._ap = None
 
         # 跨步常驻的输入批：持久行槽位 + 增量块表 + 每步展开缓冲（对齐 V1 InputBatch）
         max_num_blocks_per_req = (config.max_model_len + self.block_size - 1) // self.block_size
@@ -95,6 +98,7 @@ class ModelRunner:
                 module.k_cache = module.v_cache = None
         self.kv_cache = None
         self.cpu_kv_cache = None
+        self._ai = self._ap = None
         self.model = None
         self.input_batch = None
         # nn.Module 间存在引用环，需 gc.collect() 才能释放模型权重显存，否则 empty_cache 无效
@@ -327,6 +331,66 @@ class ModelRunner:
             step_logprobs = [lp_by_id[s.seq_id] if s.logprobs is not None else None
                              for s in seqs]
         return token_ids, step_logprobs
+
+    # ── 异步调度：非阻塞下发 + 采样 token 留 GPU 跨步前向 ─────────────────────────
+    @torch.inference_mode()
+    def execute_model_async(self, seqs, finished_seq_ids=None):
+        """非阻塞下发一步推理：构造输入时用上一步留在 GPU 的采样 token 前向回填 decode 行
+        （避免 D2H 同步），前向 + 采样后把采样张量暂存到 pending 槽，**不** .tolist()。"""
+        if finished_seq_ids:
+            for sid in finished_seq_ids:
+                self.generators.pop(sid, None)
+        self.input_batch.update(seqs, finished_seq_ids)
+        input_ids, positions, attn_md, ordered = self.input_batch.make_inputs(seqs)
+
+        # 前向：把上一步采样 token（GPU 张量）就地写入本步 decode 行的输入位（无 D2H）
+        if self._ai is not None:
+            prev_sampled, prev_index = self._ai["sampled"], self._ai["index"]
+            cu = self.input_batch.query_start_loc.np
+            dst, src = [], []
+            for r, seq in enumerate(ordered):
+                # 仅"喂生成 token"的 decode 行需前向（q==1 且喂的是已生成位而非 prompt 位）
+                if seq.num_scheduled_tokens == 1 \
+                        and seq.num_cached_tokens >= seq.num_prompt_tokens:
+                    idx = prev_index.get(seq.seq_id)
+                    if idx is not None:
+                        dst.append(int(cu[r]))
+                        src.append(idx)
+            if dst:
+                dst_t = torch.tensor(dst, device="cuda")
+                src_t = torch.tensor(src, device="cuda")
+                input_ids[dst_t] = prev_sampled[src_t]
+
+        logits = self.run_model(input_ids, positions, attn_md)
+        sampling_metadata = self.prepare_sample(ordered)
+        sampler_output = self.sampler(logits, sampling_metadata)
+        self._ap = {
+            "sampled": sampler_output.sampled_token_ids,   # GPU 张量 [n]，不同步
+            "ordered": ordered,
+            "index": {seq.seq_id: r for r, seq in enumerate(ordered)},
+            "logprobs": sampler_output.logprobs_tensors,
+        }
+
+    @torch.inference_mode()
+    def resolve_inflight(self):
+        """D2H 同步取回 inflight（上一步）结果：返回 (tok_by_id, lp_by_id)。"""
+        ai = self._ai
+        ordered = ai["ordered"]
+        row_tokens = ai["sampled"].tolist()
+        tok_by_id = {seq.seq_id: tok for seq, tok in zip(ordered, row_tokens)}
+        lp_by_id = None
+        lt = ai["logprobs"]
+        if lt is not None:
+            ids = lt.logprob_token_ids.tolist()
+            vals = lt.logprobs.tolist()
+            lp_by_id = {ordered[r].seq_id: dict(zip(ids[r], vals[r]))
+                        for r in range(len(ordered)) if ordered[r].logprobs is not None}
+        return tok_by_id, lp_by_id
+
+    def promote_async(self):
+        """把本步刚算出的采样张量提升为 inflight（下一步前向源 + 下一步待回收）。"""
+        self._ai = self._ap
+        self._ap = None
 
     @torch.inference_mode()
     def capture_cudagraph(self):

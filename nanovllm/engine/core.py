@@ -35,7 +35,7 @@ class EngineCore:
         self.config = config
 
         # Executor 构造时完成各 rank Worker 初始化（含 rank0 warmup → 填好
-        # config.num_kvcache_blocks），之后才能据此构建 Scheduler 的 BlockManager。
+        # config.num_kvcache_blocks），之后才能据此构建 Scheduler 的 KVCacheManager。
         executor_class = Executor.get_class(config)
         self.executor = executor_class(config)
 
@@ -52,6 +52,9 @@ class EngineCore:
         self.requests: dict[str, Sequence] = {}
         # 最近一步的调度统计（可观测性；get_stats 取用）
         self.scheduler_stats = None
+        # 异步调度：已下发 GPU 但结果尚未回收的"在飞"步（SchedulerOutput），None 表示无
+        self.async_scheduling = config.async_scheduling
+        self._inflight = None
         atexit.register(self.exit)
 
     def get_stats(self):
@@ -80,10 +83,16 @@ class EngineCore:
                 self.scheduler.abort(seq)
 
     def has_unfinished_requests(self) -> bool:
-        return not self.scheduler.is_finished()
+        # 异步调度下还需排空"在飞"步（其结果尚未回收）
+        return not self.scheduler.is_finished() or self._inflight is not None
 
     # ── 单步推理 ──────────────────────────────────────────────────────────────
     def step(self) -> EngineCoreOutputs:
+        if self.async_scheduling:
+            return self._step_async()
+        return self._step_sync()
+
+    def _step_sync(self) -> EngineCoreOutputs:
         """调度一批 → 执行 → 后处理 → 收集每请求增量。"""
         sched_output = self.scheduler.schedule()
         self.scheduler_stats = self.scheduler.make_stats(
@@ -122,8 +131,70 @@ class EngineCore:
                 logprobs=step_logprobs[i] if step_logprobs is not None else None,
             ))
 
-        # 吞吐提示：任一 seq 调度 >1 token 记为含 prefill，否则纯 decode
+        return EngineCoreOutputs(outputs=outputs,
+                                 num_tokens=self._throughput_hint(sched_output))
+
+    def _throughput_hint(self, sched_output) -> int:
+        """吞吐提示：任一 seq 调度 >1 token 记为含 prefill（正数 token 数），否则纯 decode（负 seq 数）。"""
         is_prefill_step = any(n > 1 for n in sched_output.num_scheduled_tokens.values())
-        num_tokens = (sched_output.total_num_scheduled_tokens
-                      if is_prefill_step else -len(seqs))
-        return EngineCoreOutputs(outputs=outputs, num_tokens=num_tokens)
+        return (sched_output.total_num_scheduled_tokens if is_prefill_step
+                else -len(sched_output.scheduled_seqs))
+
+    # ── 异步调度：step N 的 GPU 计算与 step N+1 的 CPU 调度重叠 ──────────────────
+    def _step_async(self) -> EngineCoreOutputs:
+        """流水深度 1 的异步调度（仅 UniProc）：
+
+          1. schedule 本步并**非阻塞**下发 GPU（采样 token 留在 GPU，前向喂给本步输入，
+             不做 D2H 同步）——此时上一步的 GPU 计算与本步的 CPU 调度已重叠；
+          2. 回收上一步（在飞）结果：D2H 同步取回 token、回填占位、判定 EOS、产出增量；
+          3. 推进本步记账（在 resolve 之后，故已结束序列被跳过、哈希见已回填 token），
+             promote 本步采样张量为下一步的前向源。
+        """
+        sched_output = self.scheduler.schedule()
+        self.scheduler_stats = self.scheduler.make_stats(
+            sched_output.total_num_scheduled_tokens)
+
+        launched = not sched_output.is_empty
+        if launched:
+            # 非阻塞下发：内部用上一步留在 GPU 的采样 token 前向回填本步 decode 输入
+            self.executor.execute_model_async(
+                sched_output.scheduled_seqs, sched_output.finished_seq_ids)
+
+        outputs = EngineCoreOutputs()
+        if self._inflight is not None:
+            tok_by_id, lp_by_id = self.executor.resolve_inflight()   # D2H 同步取回上一步
+            token_ids = [tok_by_id[s.seq_id] for s in self._inflight.scheduled_seqs]
+            produced = self.scheduler.resolve_output(self._inflight, token_ids)
+            outputs = self._build_async_outputs(produced, lp_by_id, self._inflight)
+
+        if launched:
+            # 推进必须在 resolve 之后：已结束序列被 advance 跳过；哈希见已回填的真实 token
+            self.scheduler.advance_after_schedule(sched_output)
+            self.executor.promote_async()
+            self._inflight = sched_output
+        else:
+            # 空调度步未下发 model → 本步排空的 finished_seq_ids 无处投递给 InputBatch
+            # 回收行槽位，退回累积器留待下一次 launch（可能是下个 generate）处理。
+            self.scheduler.finished_req_ids |= sched_output.finished_seq_ids
+            self._inflight = None
+        return outputs
+
+    def _build_async_outputs(self, produced, lp_by_id, sched_output) -> EngineCoreOutputs:
+        outputs: list[EngineCoreOutput] = []
+        for seq in produced:
+            finished = seq.is_finished
+            finish_reason = None
+            if finished:
+                finish_reason = (FinishReason.LENGTH
+                                 if seq.num_completion_tokens >= seq.max_tokens
+                                 else FinishReason.STOP)
+                self.requests.pop(seq.request_id, None)
+            outputs.append(EngineCoreOutput(
+                request_id=seq.request_id,
+                new_token_ids=[seq.last_token],
+                finished=finished,
+                finish_reason=finish_reason,
+                logprobs=lp_by_id.get(seq.seq_id) if lp_by_id is not None else None,
+            ))
+        return EngineCoreOutputs(outputs=outputs,
+                                 num_tokens=self._throughput_hint(sched_output))

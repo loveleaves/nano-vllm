@@ -28,12 +28,15 @@
 
 ```
 nanovllm/engine/kv_cache/
-├── __init__.py            # 导出 BlockPool/KVCacheBlock/Block/KVCacheManager/BlockManager/KVCacheSpec/FullAttentionSpec
+├── __init__.py            # 导出 BlockPool/KVCacheBlock/KVCacheManager/KVCacheSpec/FullAttentionSpec
 ├── interface.py           # KVCacheSpec(ABC) + FullAttentionSpec（page_size_bytes / kv_cache_shape / num_blocks_for_memory）
-├── block_pool.py          # KVCacheBlock(=旧 Block) + BlockPool（块级原语 + 哈希表 + 引用计数）
-└── kv_cache_manager.py    # KVCacheManager（每请求编排）; BlockManager = KVCacheManager 别名
-nanovllm/engine/block_manager.py   # 向后兼容垫片：re-export BlockManager/KVCacheManager/BlockPool/Block
+├── block_pool.py          # KVCacheBlock + BlockPool（块级原语 + 哈希表 + 引用计数）
+└── kv_cache_manager.py    # KVCacheManager（每请求编排）
 ```
+
+> 注：早期保留的 `engine/block_manager.py` 垫片、`BlockManager`/`Block` 别名及 KVCacheManager
+> 上的委派属性（blocks/free_block_ids/…/compute_hash）已移除（清理向后兼容）；调用方直接用
+> `KVCacheManager` 并经 `mgr.block_pool.*` 访问块池状态。
 
 ### 职责切分
 
@@ -69,8 +72,8 @@ Scheduler（不变）→ block_manager.can_allocate/allocate/deallocate/can_appe
 - **行为等价**：`FullAttentionSpec.page_size_bytes = 2*block_size*num_kv_heads*head_dim*itemsize`，
   `num_blocks = available // (page_size_bytes * num_layers)`，与旧 `block_bytes` 公式逐位一致；
   全局张量形状 `(2, num_layers, num_blocks, block_size, num_kv_heads, head_dim)` 不变。
-- **向后兼容**：`BlockManager` 为 `KVCacheManager` 别名；旧属性（blocks/free_block_ids/
-  used_block_ids/hash_to_block_id）与 `compute_hash` 经委派保留，Scheduler 与既有
-  `test_block_manager` 零改动通过。
+- **块池访问**：块级状态（blocks/free_block_ids/used_block_ids/hash_to_block_id）与
+  `compute_hash` 由 `BlockPool` 持有，调用方经 `KVCacheManager.block_pool.*` 访问
+  （早期在 KVCacheManager 上的委派属性与 `BlockManager` 别名已移除）。
 - **延迟淘汰**：释放块时 hash 暂留（`deref_block` 仅归还空闲队列），下次 `get_new_block`
   取到该块才删旧 hash，保证前缀缓存最大化命中——逻辑从旧 BlockManager 原样迁入。

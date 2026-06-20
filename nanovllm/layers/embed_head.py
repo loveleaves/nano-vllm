@@ -77,8 +77,3 @@ class ParallelLMHead(VocabParallelEmbedding):
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, dim=-1) if self.tp_rank == 0 else None
         return logits
-
-
-# 为了向后兼容 Phase 2/3 的 VocabEmbedding / LMHead 接口
-VocabEmbedding = VocabParallelEmbedding
-LMHead = ParallelLMHead

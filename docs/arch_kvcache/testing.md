@@ -8,7 +8,7 @@
 |---|---|---|
 | `test_block_pool.py` | 初始状态；get_new_block + deref；ref>1 时 deref 不释放；register_hash/cached_block_id 往返；reuse_cached_block（ref++ / 从空闲取出）；重分配淘汰旧 hash；FIFO 复用顺序 | CPU |
 | `test_kv_cache_spec.py` | page_size_bytes；kv_cache_shape；num_blocks_for_memory 往返 + 向下取整；dtype 影响块大小 | CPU（仅用 torch.dtype.itemsize） |
-| `test_block_manager.py`（保留） | 原 BlockManager 全部用例（基础分配 + 前缀缓存哈希），验证兼容别名/委派属性行为不变 | CPU |
+| `test_block_manager.py` | KVCacheManager 全部用例（基础分配 + 前缀缓存哈希）；块池状态经 `mgr.block_pool.*` 访问，哈希经 `BlockPool.compute_hash`（早期兼容别名/委派属性已移除） | CPU |
 
 ## 回归
 

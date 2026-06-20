@@ -20,7 +20,7 @@
 ```
 layers/attention/
 ├── registry.py     # AttentionBackendEnum + register_backend + resolve_obj_by_qualname + _ATTN_OVERRIDES
-├── selector.py     # get_attn_backend(head_size, dtype, device_type[, is_cuda])：能力筛选 + 回退
+├── selector.py     # get_attn_backend(head_size, dtype, device_type)：能力筛选 + 回退
 ├── backend.py      # AttentionBackend 基类 + 能力 classmethod（is_available/supports_head_size/supports_dtype）
 ├── flash_attn.py   # FlashAttentionBackend：supported_dtypes=[fp16,bf16]；is_available=cuda∧HAS_FLASH；head≤256∧%8
 ├── torch_sdpa.py   # TorchSDPABackend：任意平台/head_size，dtypes=[fp16,bf16,fp32]
@@ -51,8 +51,8 @@ get_attn_backend(head_size, dtype, device_type):
   优先读取；`clear_override` 还原。支持装饰器与直接两种调用。
 - **能力子类覆盖**：FlashAttn 覆盖 `is_available`（cuda ∧ 已安装）与 `supports_head_size`
   （≤256 且 8 的倍数）；SDPA 全许可（兜底）。故 cuda 上 head=300 或 fp32 会**自动回退 SDPA**。
-- **向后兼容**：保留 `get_attn_backend(is_cuda=...)` 旧签名（device_type 未给时由 is_cuda 推断），
-  C 轮测试与调用零改动。
+- **设备判定**：`get_attn_backend(device_type=...)`；未给时由当前默认设备推断。
+  > 注：早期保留的 `is_cuda=...` 旧签名参数已移除（清理向后兼容），调用方用 `device_type`。
 
 ### 为何 builder 仍恒等（差距 ② 不补）
 

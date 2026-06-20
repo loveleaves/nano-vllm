@@ -60,5 +60,6 @@ EngineCore.step():
   `priority` 经 SamplingParams 之外的独立通道（Sequence.priority / EngineCoreRequest.priority /
   Processor.process_inputs(priority=) / LLMEngine.add_request(priority=)）透传，默认 0。
 - **preempt** 用 `waiting.prepend_request`（FCFS 回插队首；Priority 按优先级归位）。
-- **向后兼容**：保留 `engine/scheduler.py` 垫片与 `Scheduler.add`（= `add_request`）别名，
-  旧 import / 调用不破。`Config.scheduling_policy` 默认 `"fcfs"`，行为与对齐前一致。
+- **导入路径**：`Scheduler` 经 `nanovllm.engine.sched` 导出（调用方用 `add_request`）。
+  `Config.scheduling_policy` 默认 `"fcfs"`，行为与对齐前一致。
+  > 注：早期保留的 `engine/scheduler.py` 垫片与 `Scheduler.add` 别名已移除（清理向后兼容）。

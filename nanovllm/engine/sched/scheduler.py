@@ -1,7 +1,7 @@
 from collections import deque
 
 from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.kv_cache import KVCacheManager
 from nanovllm.engine.sched.interface import SchedulerInterface
 from nanovllm.engine.sched.output import SchedulerOutput
 from nanovllm.engine.sched.request_queue import (
@@ -38,7 +38,7 @@ class Scheduler(SchedulerInterface):
         self.max_num_batched_tokens = max_num_batched_tokens
         self.eos = eos
         self.block_size = block_size
-        self.block_manager = BlockManager(num_kvcache_blocks, block_size, num_swap_blocks)
+        self.block_manager = KVCacheManager(num_kvcache_blocks, block_size, num_swap_blocks)
         self.swap_enabled = num_swap_blocks > 0
         self.waiting: RequestQueue = create_request_queue(policy)
         self.running: deque[Sequence] = deque()
@@ -50,9 +50,6 @@ class Scheduler(SchedulerInterface):
     # ── 接口实现 ──────────────────────────────────────────────────────────────
     def add_request(self, seq: Sequence):
         self.waiting.add_request(seq)
-
-    # 向后兼容别名（旧测试 / 调用方用 .add）
-    add = add_request
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
@@ -82,6 +79,7 @@ class Scheduler(SchedulerInterface):
         """
         scheduled_seqs: list[Sequence] = []
         num_scheduled: dict[int, int] = {}
+        produced_seq_ids: set[int] = set()   # 本步产出 token 的 seq（decode + prefill 收尾）
         preempted_seq_ids: set[int] = set()
         swap_out_list: list[tuple[int, int]] = []
         swap_in_list: list[tuple[int, int]] = []
@@ -124,6 +122,7 @@ class Scheduler(SchedulerInterface):
             scheduled_seqs.append(seq)
             decode_scheduled.append(seq)
             num_scheduled[seq.seq_id] = 1
+            produced_seq_ids.add(seq.seq_id)   # decode 步必产 token
             num_batched_tokens += 1
         # 本步 decode 的 running seq 放回 running 队列（保持原序）
         self.running.extendleft(reversed(decode_scheduled))
@@ -155,10 +154,11 @@ class Scheduler(SchedulerInterface):
             num_batched_tokens += n
 
             if seq.num_cached_tokens + n == seq.num_tokens:
-                # 本步完成整个 prompt（或最后一个 chunk）→ 转入 decode 队列
+                # 本步完成整个 prompt（或最后一个 chunk）→ 转入 decode 队列，产出首 token
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.pop_request()
                 self.running.append(seq)
+                produced_seq_ids.add(seq.seq_id)
             # 否则 chunk 未完成，seq 留在 waiting 队首，下一步续算
 
             scheduled_seqs.append(seq)
@@ -172,6 +172,7 @@ class Scheduler(SchedulerInterface):
             finished_seq_ids=finished_seq_ids | preempted_seq_ids,
             blocks_to_swap_out=swap_out_list,
             blocks_to_swap_in=swap_in_list,
+            produced_token_seq_ids=produced_seq_ids,
         )
 
     def preempt(self, seq: Sequence, swap_out_list: list[tuple[int, int]] | None = None):
@@ -185,6 +186,9 @@ class Scheduler(SchedulerInterface):
             归零（is_prefill 自动恢复 True），seq 推回 waiting 队首重算。
 
         两种策略前缀缓存的块 hash 都保留，下次大概率再次命中。
+
+        异步调度：被抢占 recompute 的序列丢弃其未回填的占位 token（其在飞结果将在
+        resolve_output 中按"非运行态"跳过），从最后一个已回填 token 干净重算。
         """
         if self.swap_enabled and swap_out_list is not None \
                 and self.block_manager.can_swap_out(seq):
@@ -192,6 +196,8 @@ class Scheduler(SchedulerInterface):
             seq.status = SequenceStatus.WAITING
             self.swapped.append(seq)
             return
+        if seq.num_pending:
+            seq.truncate_pending()   # 同步模式恒为 0（no-op）
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.prepend_request(seq)
@@ -238,3 +244,45 @@ class Scheduler(SchedulerInterface):
                 if seq in self.running:
                     self.running.remove(seq)
                 self.finished_req_ids.add(seq.seq_id)
+
+    # ── 异步调度：调度时推进记账 + 结果返回时回填 ────────────────────────────────
+    def advance_after_schedule(self, output: SchedulerOutput):
+        """异步调度：紧随 schedule() 推进序列记账（不等结果），使下一步可立即调度。
+
+        镜像 update_from_output 的"长度推进"部分，但对产出 token 的步追加**占位** token
+        （真实值经 GPU 前向喂给下一步、结果返回时由 resolve_output 回填），且不做 EOS 判定
+        （EOS 在 resolve_output 检出）。已结束序列（上一步 EOS 检出）跳过。
+        """
+        for seq in output.scheduled_seqs:
+            if seq.is_finished:
+                continue
+            self.block_manager.hash_blocks(seq)   # 仅哈希已喂入（已知）token 的满块
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+            if seq.seq_id in output.produced_token_seq_ids:
+                seq.append_placeholder()
+
+    def resolve_output(self, output: SchedulerOutput,
+                       token_ids: list[int]) -> list[Sequence]:
+        """异步调度：在飞步结果返回时回填占位 token + EOS/max 判定，返回产出 token 的序列。
+
+        已结束序列（被多调度一步）丢弃其占位与垃圾结果。返回的序列供 EngineCore 产出增量。
+        """
+        produced: list[Sequence] = []
+        for seq, token_id in zip(output.scheduled_seqs, token_ids):
+            # 仅回填仍在 decode 的序列：跳过 partial prefill（无 token）、已结束（多调度
+            # 一步）、被抢占/中止（status≠RUNNING 或无待回填占位）——其在飞结果丢弃。
+            if seq.seq_id not in output.produced_token_seq_ids:
+                continue
+            if seq.status != SequenceStatus.RUNNING or seq.num_pending == 0:
+                continue
+            seq.resolve_placeholder(token_id)
+            if (not seq.ignore_eos and token_id == self.eos) or \
+               seq.num_completion_tokens == seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                if seq in self.running:
+                    self.running.remove(seq)
+                self.finished_req_ids.add(seq.seq_id)
+            produced.append(seq)
+        return produced

@@ -41,7 +41,7 @@ class TestSelector:
     @pytest.mark.unit
     def test_cpu_selects_sdpa(self):
         os.environ.pop("NANOVLLM_ATTN_BACKEND", None)
-        assert get_attn_backend(is_cuda=False) is TorchSDPABackend
+        assert get_attn_backend(device_type="cpu") is TorchSDPABackend
 
     @pytest.mark.unit
     def test_cuda_with_flash_selects_flash(self):
@@ -49,15 +49,15 @@ class TestSelector:
         # flash_attn 已安装的环境下，cuda → flash
         from nanovllm.layers.attention.flash_attn import HAS_FLASH_ATTN
         expected = FlashAttentionBackend if HAS_FLASH_ATTN else TorchSDPABackend
-        assert get_attn_backend(is_cuda=True) is expected
+        assert get_attn_backend(device_type="cuda") is expected
 
     @pytest.mark.unit
     def test_env_override_forces_backend(self):
         try:
             os.environ["NANOVLLM_ATTN_BACKEND"] = "torch_sdpa"
-            assert get_attn_backend(is_cuda=True) is TorchSDPABackend
+            assert get_attn_backend(device_type="cuda") is TorchSDPABackend
             os.environ["NANOVLLM_ATTN_BACKEND"] = "flash_attn"
-            assert get_attn_backend(is_cuda=False) is FlashAttentionBackend
+            assert get_attn_backend(device_type="cpu") is FlashAttentionBackend
         finally:
             os.environ.pop("NANOVLLM_ATTN_BACKEND", None)
 

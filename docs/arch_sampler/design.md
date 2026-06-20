@@ -28,8 +28,9 @@ nanovllm/layers/sample/
     ├── topk_topp.py      # apply_top_k_top_p / apply_top_k_only / random_sample / TopKTopPSampler
     ├── penalties.py      # apply_all_penalties + bin_counts/mask + repetition(纯 torch)
     └── logprobs.py       # compute_logprobs / gather_logprobs
-nanovllm/layers/sampler.py   # 向后兼容垫片 → re-export
 ```
+
+> 注：早期的 `nanovllm/layers/sampler.py` 向后兼容垫片已移除；统一从 `nanovllm.layers.sample` 导入。
 
 ## 调用链与关键点
 

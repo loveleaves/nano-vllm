@@ -47,6 +47,8 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
+        # 异步调度：尾部"已调度但 token 值未回填"的占位 token 数（同步模式恒为 0）
+        self.num_pending = 0
         self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -114,6 +116,35 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    # ── 异步调度：占位 token 的追加 / 回填 / 截断 ────────────────────────────────
+    def append_placeholder(self):
+        """异步调度时为"已调度但 token 值未知"的位置追加占位 token（值 0，稍后回填）。
+
+        让 num_tokens/长度提前推进，使下一步调度能算对 position 与块分配；真实 token 值
+        经 GPU 前向喂给下一步（不读此占位），并在结果返回时由 resolve_placeholder 回填。
+        """
+        self.token_ids.append(0)
+        self.last_token = 0
+        self.num_tokens += 1
+        self.num_pending += 1
+
+    def resolve_placeholder(self, token_id: int):
+        """结果返回时，把最早一个未回填的占位 token 覆写为真实采样值。"""
+        assert self.num_pending > 0
+        idx = self.num_tokens - self.num_pending
+        self.token_ids[idx] = token_id
+        self.num_pending -= 1
+        if idx == self.num_tokens - 1:
+            self.last_token = token_id
+
+    def truncate_pending(self):
+        """丢弃所有未回填的占位 token（用于已结束序列的"多调度一步"清理）。"""
+        while self.num_pending > 0:
+            self.token_ids.pop()
+            self.num_tokens -= 1
+            self.num_pending -= 1
+        self.last_token = self.token_ids[-1]
 
     def __getstate__(self):
         """

@@ -192,10 +192,10 @@ non_blocking=True：
 ### 3.2 nano-vllm 中的使用
 
 ```python
-# model_runner.py: prepare_prefill/decode()
-input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-#                                                       ↑                    ↑
-#                                               分配固定内存               异步 H2D
+# engine/input_batch.py: make_inputs / block_table.py: CpuGpuBuffer.copy_to_gpu
+# 各数组写入常驻 pinned 缓冲（self.input_ids.np[:n]=...）后单次异步上传：
+self.input_ids.gpu[:n].copy_(self.input_ids.cpu[:n], non_blocking=True)
+#       ↑ 常驻 pinned CPU 缓冲（pin_memory=True）        ↑ 异步 H2D
 ```
 
 **效果**：CPU 构建张量 + H2D 传输与 GPU 执行前一步的 kernel 可以重叠，隐藏传输延迟（PCIe 4.0 ×16 峰值 ~32 GB/s，传输 4 MB 需 ~0.1 ms）。
@@ -215,22 +215,28 @@ torch.cuda.synchronize()
 
 | 优化技术 | 实现位置 | 核心机制 | 收益 |
 |---------|---------|---------|------|
-| **PagedAttention** | `block_manager.py` | KV cache 分页，消除碎片 | 内存利用率 ↑，并发 ↑ |
-| **前缀缓存** | `block_manager.py` | 链式哈希，跨请求复用 KV 块 | prefill 计算量 ↓，相同前缀命中 |
-| **Chunked Prefill** | `scheduler.py` | 长 prompt 分块，避免 decode 饥饿 | TTFT ↓，延迟更平稳 |
-| **FlashAttention** | `attention.py` | IO-aware tiling，SRAM 内完成 softmax | HBM 读写 ↓ O(n²→n)，速度 ↑ |
-| **KV 写入 Triton kernel** | `attention.py` | 向量化分散写，slot_mapping，无中间张量 | 显存分配 ↓，写入延迟 ↓ |
-| **CUDA Graph** | `model_runner.py` | 静态 graph replay，Python overhead 归零 | decode 小 batch 延迟 ↓ 50%+ |
+| **PagedAttention** | `engine/kv_cache/` | KV cache 分页，消除碎片 | 内存利用率 ↑，并发 ↑ |
+| **前缀缓存** | `engine/kv_cache/block_pool.py` | 链式哈希，跨请求复用 KV 块 | prefill 计算量 ↓，相同前缀命中 |
+| **统一连续批 + Chunked Prefill** | `engine/sched/` | decode+prefill chunk 混排，避免 decode 饥饿 | TTFT ↓，TPOT 更平稳 |
+| **持久化 InputBatch** | `engine/input_batch.py` + `block_table.py` | 跨步常驻行 + 增量块表 + 单次切片 H2D | 每步 CPU 构建/H2D ↓ |
+| **FlashAttention（多后端）** | `layers/attention/` | varlen 统一 prefill/decode；registry+能力选择 | HBM 读写 ↓ O(n²→n)，速度 ↑ |
+| **KV 写入 Triton kernel** | `layers/attention/kv_ops.py` | 向量化分散写，slot_mapping，无中间张量 | 显存分配 ↓，写入延迟 ↓ |
+| **CUDA Graph** | `engine/model_runner.py` | 静态 graph replay，Python overhead 归零 | decode 小 batch 延迟 ↓ 50%+ |
 | **torch.compile** | 各 layer | JIT 算子融合，消除中间张量 | elementwise / 归一化速度 ↑ |
-| **Fused Add-RMSNorm** | `layernorm.py` | 合并残差相加 + 归一化 | HBM bandwidth ↓ 50% |
-| **Tensor Parallelism** | `linear.py`, `embed_head.py` | 权重切分 + NCCL all_reduce | 多 GPU 显存 + 算力线性扩展 |
-| **pin_memory + non_blocking** | `model_runner.py` | H2D 异步传输与 GPU 计算重叠 | PCIe 传输延迟 ↓ |
-| **lru_cache RoPE** | `rotary_embedding.py` | 所有层共享一个 cos_sin_cache | 显存 ↓（28 层 → 1 份缓存），初始化 ↑ |
-| **Gumbel-max 采样** | `sampler.py` | 完全向量化，避免串行 multinomial | 采样并行化，大词表下尤为显著 |
+| **Fused Add-RMSNorm** | `layers/layernorm.py` | 合并残差相加 + 归一化 | HBM bandwidth ↓ 50% |
+| **Tensor Parallelism** | `layers/linear.py`, `embed_head.py` | 权重切分 + NCCL all_reduce | 多 GPU 显存 + 算力线性扩展 |
+| **pin_memory + non_blocking** | `engine/block_table.py::CpuGpuBuffer` | H2D 异步传输与 GPU 计算重叠 | PCIe 传输延迟 ↓ |
+| **lru_cache RoPE** | `layers/rotary_embedding.py` | 所有层共享一个 cos_sin_cache | 显存 ↓（N 层 → 1 份缓存） |
+| **结构化采样层** | `layers/sample/` | greedy/top-k/top-p/penalties/logprobs；Gumbel 随机采样向量化 | 功能完整 + 大词表并行 |
 
 ---
 
 ## 五、从零实现路线图
+
+> 这是一条**最小可用**的从零搭建路径（教学用）。当前 `phase5` 仓库在此基础上进一步对齐 vLLM V1
+> 把各模块重构为子包/组件（引擎拆分、sched/、kv_cache/、executor/、InputBatch、sample/、attention
+> 注册表），详见各 `arch_*/` 与 [nano_vs_vllm-架构对比](nano_vs_vllm-架构对比-20260618.md)。下文步骤已对齐
+> 当前的关键事实（统一连续批、显式 AttentionMetadata、varlen 统一注意力）。
 
 按依赖关系分阶段实现，每阶段可独立验证：
 
@@ -257,8 +263,9 @@ torch.cuda.synchronize()
    — can_append，may_append
 
 5. engine/scheduler.py（基础 FCFS）
-   — 只有 prefill 路径，不加分块，不加抢占
-   — postprocess 只做 append_token + 终止检查
+   — 先实现 prefill 路径，不加分块，不加抢占
+   — update_from_output 只做 append_token + 终止检查
+   （当前仓库升级为 sched/ 子包：SchedulerInterface + 结构化 SchedulerOutput + 可插拔队列）
 
 验证：手动创建 Sequence，模拟分配/释放/调度流程，打印 block_table。
 ```
@@ -267,8 +274,8 @@ torch.cuda.synchronize()
 
 ```
 6.  utils/context.py
-    — set_context / get_context / reset_context
-    — Context dataclass（is_prefill 字段最重要）
+    — AttentionMetadata dataclass（query_start_loc / cu_seqlens_k / slot_mapping / block_table）
+    — 经 model.forward(input_ids, positions, attn_md) 显式透传到 Attention 层（非全局单例）
 
 7.  layers/layernorm.py
     — RMSNorm（先不加 fused add-norm，直接 x = x / rms * weight）
@@ -296,7 +303,7 @@ torch.cuda.synchronize()
 
 14. models/qwen3.py（单 GPU 版本）
     — 组装 Transformer：Embedding + N×DecoderLayer + Norm + LMHead
-    — compute_logits：取 last token（prefill）或全部（decode）
+    — compute_logits：统一用 query_start_loc[1:]-1 取每序列末 token（prefill/decode 同一逻辑）
 
 验证：随机权重 forward，检查 output shape 正确（[batch, vocab_size]）。
 ```
@@ -312,13 +319,14 @@ torch.cuda.synchronize()
 16. engine/model_runner.py（单进程版本）
     — warmup_model（构造虚假 prefill，测峰值）
     — allocate_kv_cache（按剩余显存计算 num_blocks，分配大张量）
-    — prepare_prefill（slot_mapping 计算是重点）
-    — prepare_decode
-    — run（调用 run_model + sampler）
+    — prepare_inputs：统一连续批构造 input_ids/positions/cu_seqlens/slot_mapping（slot_mapping 是重点）
+      （当前仓库进一步抽成持久化 InputBatch：跨步常驻行 + 增量块表）
+    — run（构造 AttentionMetadata → run_model → sampler）
 
 17. engine/llm_engine.py（单进程，无 TP）
     — generate（tokenize + 创建 Sequence + 主循环）
-    — step（schedule → run → postprocess）
+    — step（schedule → execute_model → update_from_output）
+      （当前仓库拆为 Processor + EngineCore + OutputProcessor，并加 AsyncLLM 异步流式）
 
 验证：加载真实权重，单条 prompt 能生成连贯文本。
       enforce_eager=True，逐 token 打印。
@@ -327,34 +335,29 @@ torch.cuda.synchronize()
 ### 阶段四：工程优化（按独立性并行推进）
 
 ```
-18. 替换 FlashAttention（attention.py）
-    — prefill: flash_attn_varlen_func（注意 cu_seqlens 格式）
-    — decode:  flash_attn_with_kvcache（注意 q.unsqueeze(1)）
+18. FlashAttention（layers/attention/）
+    — 统一 flash_attn_varlen_func 覆盖 prefill 与 decode（decode = query_len 1 的退化）：
+      block_table 非 None 即从分页 cache 读历史 KV，无需 with_kvcache 分支
+    — 多后端：backend 三件套 + registry（AttentionBackendEnum）+ 能力选择（flash/sdpa）
 
-19. Triton KV 写入（attention.py）
-    — store_kvcache_kernel（关键：slot=-1 的处理）
-    — 替换 Python scatter
+19. Triton KV 写入（layers/attention/kv_ops.py）
+    — store_kvcache_kernel（关键：slot=-1 的处理）；替换 Python scatter
 
-20. Tensor Parallelism（linear.py, embed_head.py, model_runner.py）
-    — 先实现 ColumnParallelLinear / RowParallelLinear
-    — 再实现 QKVParallelLinear / MergedColumnParallelLinear
-    — model_runner.py：init_process_group + SharedMemory + loop
+20. Tensor Parallelism（linear.py, embed_head.py, executor/）
+    — 先实现 ColumnParallelLinear / RowParallelLinear，再 QKV / Merged
+    — Executor 抽象编排进程：UniProc 内联 / MultiProc（spawn + ShmTransport 广播 + ResultChannel 回传）
 
 21. CUDA Graph（model_runner.py）
-    — capture_cudagraph：warmup → 从大到小录制 → 共享 pool
-    — run_model：按 bs 选 graph，修改静态张量，replay
-    — graph_vars 的 block_tables 需要足够大（max_blocks）
+    — capture_cudagraph：warmup → 从大到小录制 → 共享 pool（用静态 AttentionMetadata）
+    — run_model：纯 decode 批按 bs 选 graph，写静态张量，replay
 
-22. Prefix Caching（block_manager.py + scheduler.py）
-    — compute_hash（链式 xxhash）
-    — can_allocate 中的哈希探测逻辑
-    — hash_blocks（postprocess 后注册满块哈希）
-    — _allocate_block 中的脏哈希清理
+22. Prefix Caching（kv_cache/block_pool.py + sched/scheduler.py）
+    — compute_hash（链式 xxhash）；can_allocate 中的哈希探测
+    — hash_blocks（update_from_output 后注册满块哈希）；脏哈希清理
 
-23. Chunked Prefill（scheduler.py）
-    — remaining budget 计算
-    — "只有第一个 seq 允许分块"的 break 条件
-    — postprocess 中间步不 append_token 的逻辑
+23. 统一连续批 + Chunked Prefill（sched/scheduler.py）
+    — 一步内先调度 RUNNING decode（每 seq 1 token），再用剩余预算给 WAITING prefill chunk，混排同批
+    — 任意队首 seq 可分块（不限第一个）；update_from_output 中 is_prefill 派生为真时不 append_token
 
 24. Fused Add-RMSNorm（layernorm.py）
     — add_rms_forward：就地加法 + 同步更新 residual
@@ -465,24 +468,16 @@ class W8A16Linear(LinearBase):
 # FP8（H100）：torch.float8_e4m3fn，硬件原生支持
 ```
 
-### 6. 在线服务接口（Streaming）
+### 6. 在线服务接口（Streaming）—— 已实现 AsyncLLM（E 轮）
+
+`engine/async_llm.py::AsyncLLM` 已提供异步 generator 流式接口（每 step 增量 yield `RequestOutput`），
+见 `example_async.py`。剩余差距：未做 OpenAI 兼容 HTTP server（仅引擎侧异步通路）。
 
 ```python
-# llm_engine.py
-async def generate_stream(self, prompt: str, sampling_params):
-    seq = Sequence(tokenize(prompt), sampling_params)
-    self.scheduler.add(seq)
-    while not seq.is_finished:
-        await asyncio.sleep(0)   # 让出控制权，等待 event loop 调用 step
-        yield seq.last_token     # 每 decode 一个 token 即 yield
-
-# 配合 FastAPI：
-@app.post("/v1/completions")
-async def completions(request: CompletionRequest):
-    return StreamingResponse(
-        llm.generate_stream(request.prompt, request.sampling_params),
-        media_type="text/event-stream"
-    )
+from nanovllm import AsyncLLM, SamplingParams
+async for out in async_llm.generate(prompt, SamplingParams(...), request_id):
+    print(out.delta_text, end="")   # 增量文本；out.finished 标志结束
+# 配合 FastAPI StreamingResponse 即可对外提供 SSE 流式（HTTP 层需自行补）
 ```
 
 ### 7. 多模态扩展
@@ -503,31 +498,11 @@ class MultimodalEmbedding(nn.Module):
 
 2D RoPE：图像 patch 的位置编码使用 (row, col) 二维坐标而非一维序列位置。
 
-### 8. 连续批处理精细化
+### 8. 连续批处理精细化 —— 已实现（A 轮）
 
-```python
-# 当前：prefill 和 decode 严格分步（互斥）
-# 改进：同一步内混合 prefill chunk + decode token
-
-def schedule_mixed(self):
-    scheduled = []
-    num_tokens = 0
-
-    # 先填入 decode seq（每个占 1 token）
-    for seq in self.running[:self.max_num_seqs]:
-        scheduled.append((seq, 1))
-        num_tokens += 1
-
-    # 用剩余 token budget 做 prefill
-    remaining = self.max_num_batched_tokens - num_tokens
-    if self.waiting and remaining > 0:
-        seq = self.waiting[0]
-        chunk_size = min(remaining, ...)
-        scheduled.append((seq, chunk_size))
-
-    return scheduled
-# 效果：decode TPOT 不受 prefill 影响，TTFT 和 TPOT 同时优化
-```
+统一连续批已在 `sched/scheduler.py` 落地：一步内先填 RUNNING decode（每 seq 1 token），再用剩余
+token 预算给 WAITING prefill chunk，二者混排同一 varlen 批（详见 03 §六）。decode TPOT 不再被
+prefill 阻塞。剩余可精细化方向：`async_scheduler`（提前调度下一步）、swap 抢占（当前仅 recompute）。
 
 ---
 
@@ -544,14 +519,14 @@ llm = LLM(model_path, enforce_eager=True)
 ### 逐步追踪调度
 
 ```python
-# 在 LLMEngine.step() 中打印调度信息
-seqs, is_prefill = scheduler.schedule()
-print(f"{'Prefill' if is_prefill else 'Decode'}: {len(seqs)} seqs, "
-      f"total_tokens={sum(s.num_scheduled_tokens for s in seqs)}, "
-      f"cached={sum(s.num_cached_tokens for s in seqs)}")
+# 在 EngineCore.step() 中打印调度信息
+sched_output = scheduler.schedule()
+seqs = sched_output.scheduled_seqs
+print(f"{len(seqs)} seqs, total_tokens={sched_output.total_num_scheduled_tokens}, "
+      f"finished={sched_output.finished_seq_ids}")
 for s in seqs:
-    print(f"  seq {s.seq_id}: blocks={s.block_table}, "
-          f"cached={s.num_cached_tokens}, scheduled={s.num_scheduled_tokens}")
+    print(f"  seq {s.seq_id}: blocks={s.block_table}, cached={s.num_cached_tokens}, "
+          f"scheduled={s.num_scheduled_tokens}, is_prefill={s.is_prefill}")
 ```
 
 ### slot_mapping 合法性检查

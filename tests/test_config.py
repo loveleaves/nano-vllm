@@ -24,9 +24,17 @@ class TestSamplingParams:
         assert sp.ignore_eos
 
     @pytest.mark.unit
-    def test_zero_temperature_raises(self):
+    def test_zero_temperature_is_greedy(self):
+        # temperature=0 现在表示 greedy（真贪心），不再报错
+        sp = SamplingParams(temperature=0.0)
+        assert sp.temperature == 0.0
+
+    @pytest.mark.unit
+    def test_invalid_top_p_raises(self):
         with pytest.raises(AssertionError):
-            SamplingParams(temperature=0.0)
+            SamplingParams(top_p=0.0)
+        with pytest.raises(AssertionError):
+            SamplingParams(top_p=1.5)
 
     @pytest.mark.unit
     def test_negative_temperature_raises(self):

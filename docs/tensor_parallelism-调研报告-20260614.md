@@ -326,4 +326,4 @@ if self.reduce_results and self.tp_size > 1:
 - nano-vllm 源码：`nanovllm/layers/linear.py`、`nanovllm/layers/embed_head.py`、`nanovllm/engine/model_runner.py`、`nanovllm/engine/llm_engine.py`、`nanovllm/models/qwen3.py`、`nanovllm/config.py`（commit `f8d495d`，phase4 分支）
 - vLLM 源码（本地 checkout `/home/cb/work/vllm/vllm`）：`vllm/distributed/parallel_state.py`、`vllm/model_executor/layers/linear.py`、`vllm/model_executor/layers/vocab_parallel_embedding.py`、`vllm/distributed/communication_op.py`
 - 算法背景：Megatron-LM 张量并行（Shoeybi et al., 2019）
-- 相关文档：`docs/detailed_design.md`、`docs/prefix_caching-调研报告-20260614.md`、`docs/chunked_prefill-调研报告-20260614.md`
+- 相关文档：`docs/02_core_concepts.md`、`docs/prefix_caching-调研报告-20260614.md`、`docs/chunked_prefill-调研报告-20260614.md`

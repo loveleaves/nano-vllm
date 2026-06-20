@@ -116,13 +116,13 @@ T2: block_manager.allocate(seq, num_cached_blocks)
               或重激活（若在 free_block_ids）
       其余块：从空闲队列分配新块
       seq.num_cached_tokens = num_cached_blocks * block_size
-      ← prepare_prefill 中 input_ids 从 num_cached_tokens 开始
+      ← InputBatch.make_inputs 中 input_ids 从 num_cached_tokens 开始
 
 T3: prefill forward
       Attention 中：cu_seqlens_k > cu_seqlens_q 说明有历史 KV
       flash_attn_varlen_func 用 block_table 读取历史 KV 块
 
-T4: postprocess() → block_manager.hash_blocks(seq)
+T4: update_from_output() → KVCacheManager.hash_blocks(seq)
       对本步新填满的块（从上次缓存边界到本步末尾）计算哈希
       注册到 hash_to_block_id 供后续 seq 命中
 
@@ -164,66 +164,50 @@ Step 2~N: 其他所有 decode 请求被饿死，TTFT（Time To First Token）飙
 
 Chunked Prefill 将长 prompt 按 `max_num_batched_tokens`（如 4096）切分，每步只处理一个 chunk，同时允许 decode 请求混入。
 
-### 3.2 调度约束（重要细节）
+### 3.2 统一连续批调度（A 轮对齐）
+
+对齐 V1 后**无 prefill/decode 阶段切换**：一步内先调度 running 的 decode（每 seq query=1），再用剩余
+token 预算给 waiting 的 prefill chunk，二者**混排在同一批**（`scheduler.schedule()` 见 `sched/scheduler.py`）：
 
 ```python
-# scheduler.py
-while waiting:
-    seq = waiting[0]
-    remaining = max_num_batched_tokens - already_scheduled
-
-    # 关键：只有本轮第一个 seq 允许分块
-    if remaining < num_tokens and scheduled_seqs:
-        break   # 第 2+ 个 seq 必须一次完整 prefill 或等下一步
-
-    seq.num_scheduled_tokens = min(num_tokens, remaining)
-    scheduled_seqs.append(seq)
+# sched/scheduler.py（要点）
+# ① RUNNING：每 seq decode 1 token（受 max_num_seqs / token 预算约束）
+while running and len(scheduled) < max_num_seqs and budget >= 1:
+    seq = running.popleft(); seq.num_scheduled_tokens = 1; ...; budget -= 1
+# ② WAITING：用剩余预算给队首 prefill chunk
+while waiting and len(scheduled) < max_num_seqs:
+    seq = waiting.peek(); n = min(seq.num_tokens - seq.num_cached_tokens, remaining_budget)
+    seq.num_scheduled_tokens = n
+    if seq.num_cached_tokens + n == seq.num_tokens:   # 本步覆盖完整 prompt → 转入 running
+        seq.status = RUNNING; waiting.pop(); running.append(seq)
+    # 否则 chunk 未完成，留在 waiting 队首，下一步续算
 ```
 
-**为什么只允许第一个 seq 分块？**
-
-设想同时有两个长 prompt 都在分块：
-- Seq A 分块进行到 chunk 3，Seq B 分块进行到 chunk 2
-- 每步的 input_ids 是两者 chunk 的拼接，`cu_seqlens_q` 正确描述各 seq 的 query 长度
-- 理论上是正确的，但实现复杂（需追踪每个 seq 各自的分块进度）
-
-nano-vllm 采用最简策略：**最多一个 seq 做分块（waiting 队列第一个），其他 seq 必须整批 prefill**。这样调度逻辑只需追踪一个分块 seq 的进度。
+任意 waiting 队首 seq 都可分块（不再限制"仅第一个"）；每 seq 的进度由 `num_cached_tokens` 派生，
+`is_prefill = num_cached_tokens < num_prompt_tokens` 自动判定，无需显式阶段标志。
 
 ### 3.3 分块状态追踪
 
 ```
 Seq A（2000 token prompt，max_num_batched_tokens=1024）：
-
-Step 1: scheduled_tokens = 1024, is_prefill=True
-         seq 仍在 waiting（未处理完）
-         num_cached_tokens 为 0 → 处理后 = 1024
-
-Step 2: scheduled_tokens = 976 (2000-1024), is_prefill=True
-         num_cached_tokens = 1024 → 处理后 = 2000
-         2000 == num_tokens → 移入 running，状态变 RUNNING
-
-Step 3: scheduled_tokens = 1 (decode), is_prefill=False
-         num_cached_tokens 持续累积
+Step 1: num_scheduled=1024，处理后 num_cached_tokens=1024（< 2000，仍 prefill，留 waiting 队首）
+Step 2: num_scheduled=976，处理后 num_cached_tokens=2000（== prompt → 转 running，本步产首 token）
+Step 3+: num_scheduled=1（decode），num_cached_tokens 持续累积
 ```
 
-### 3.4 Chunked Prefill 与 Decode 混合批次
+### 3.4 Chunked Prefill 与 Decode 真混批
 
 ```
-waiting = [SeqA(2000 tok)]，running = [SeqB(decode), SeqC(decode)]
-
-Step 1 调度：
-  is_prefill = True（因为有 waiting 序列）
-  SeqA: chunk 1024 tokens（占满 token budget）
-  → scheduled = [SeqA]，is_prefill=True
-
-  问题：SeqB、SeqC 的 decode 被跳过了！
-
-实际 nano-vllm 行为：
-  prefill 时不处理 running 中的 decode 请求（is_prefill 独占一步）
-  只有 waiting 队列清空后才进入 decode 步
+waiting = [SeqA(2000 tok)]，running = [SeqB, SeqC]（decode 中）
+Step 1 调度（一步内混合）：
+  ① running：SeqB、SeqC 各 decode 1 token（占 2 token 预算）
+  ② waiting：SeqA chunk min(2000, budget-2) 个 prompt token
+  → scheduled_seqs = [SeqB, SeqC, SeqA]，num_scheduled = {B:1, C:1, A:chunk}
 ```
 
-> 注：真正的 prefill+decode 混批（将 decode token 加入 prefill 批次）在 nano-vllm 中未实现，这是与 vLLM 的一处差异。vLLM 的 chunked prefill 可以在同一步内混合 prefill chunk 和 decode token，进一步降低延迟。
+模型把 decode token（query=1）与 prefill chunk（query>1）拼成一个 varlen 批，`query_start_loc`
+描述各段边界。这正是 V1 的连续批 + chunked prefill，相比早期"prefill 独占步"显著降低 decode 的
+排队延迟。`update_from_output` 中，chunk 未覆盖完整 prompt 的 seq 本步不产 token。
 
 ---
 
@@ -340,13 +324,15 @@ CUDA Graph 在"录制"阶段截获所有 kernel launch 命令（不真正执行�
 for bs in reversed([1, 2, 4, 8, 16, ..., 512]):  # 从大到小
     graph = torch.cuda.CUDAGraph()
 
+    # 构造 decode 用的静态 AttentionMetadata（query_start_loc 为 arange；max_seq_len 取 max_model_len）
+    attn_md = AttentionMetadata(query_start_loc=cu_seqlens_q[:bs+1], cu_seqlens_k=cu_seqlens_k[:bs+1],
+                                max_query_len=1, max_seq_len=max_model_len,
+                                slot_mapping=slot_mapping[:bs], block_table=block_tables[:bs])
     # ① Warmup（不录制）：预热 CUDA 缓存分配器，确保 capture 时无新分配
-    set_context(False, slot_mapping[:bs], context_lens[:bs], block_tables[:bs])
-    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-
+    outputs[:bs] = self.model(input_ids[:bs], positions[:bs], attn_md)
     # ② Capture（录制所有 kernel launch）
     with torch.cuda.graph(graph, self.graph_pool):
-        outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+        outputs[:bs] = self.model(input_ids[:bs], positions[:bs], attn_md)
 
     # ③ 第一次（最大 bs）时创建 memory pool，后续 graph 共用
     if self.graph_pool is None:
@@ -362,33 +348,30 @@ PyTorch CUDA Graph 要求录制时不能有新的显存分配（CUDA caching all
 ### 5.4 Replay 详解
 
 ```python
-def run_model(self, input_ids, positions, is_prefill):
-    if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-        # 无法用 CUDA Graph（形状不固定 / 超过录制范围）
-        return self.model.compute_logits(self.model(input_ids, positions))
+def run_model(self, input_ids, positions, attn_md):
+    # 仅纯 decode 批（attn_md.is_decode_only，即 max_query_len==1）且 bs≤512 走 graph；
+    # 含 prefill chunk 的混合批 / enforce_eager / bs>512 → eager
+    if not attn_md.is_decode_only or self.enforce_eager or input_ids.size(0) > 512:
+        return self.model.compute_logits(self.model(input_ids, positions, attn_md), attn_md)
 
     bs = input_ids.size(0)
-    # 找最小的满足条件的 graph batch size
-    graph_bs = next(x for x in self.graph_bs if x >= bs)   # 如 bs=3 → graph_bs=4
-    graph = self.graphs[graph_bs]
+    graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]   # 如 bs=3 → graph_bs=4
     gv = self.graph_vars
 
     # 修改静态张量内容（graph 内核引用的是这些张量的 GPU 地址）
-    gv["input_ids"][:bs] = input_ids                # [graph_bs] 中只有前 bs 个有效
+    gv["input_ids"][:bs] = input_ids
     gv["positions"][:bs] = positions
-    gv["slot_mapping"].fill_(-1)                     # 全填 -1（无效 slot）
-    gv["slot_mapping"][:bs] = context.slot_mapping  # 前 bs 个填入真实 slot
-    gv["context_lens"].zero_()
-    gv["context_lens"][:bs] = context.context_lens
-    gv["block_tables"][:bs, :] = ...
+    gv["slot_mapping"].fill_(-1); gv["slot_mapping"][:bs] = attn_md.slot_mapping
+    gv["cu_seqlens_k"].zero_();    gv["cu_seqlens_k"][:bs+1] = attn_md.cu_seqlens_k
+    gv["block_tables"][:bs, :attn_md.block_table.size(1)] = attn_md.block_table
 
-    graph.replay()   # 一次 GPU 调用，执行全部 500+ kernel
-
-    return self.model.compute_logits(gv["outputs"][:bs])
+    graph.replay()   # 一次 GPU 调用，执行全部 kernel
+    return self.model.compute_logits(gv["outputs"][:bs], attn_md)
 ```
 
 **padding 的处理：**
-- graph 录制时 bs=4，实际 bs=3，多出的 1 个"虚假"token 的 slot=-1（Triton kernel 跳过写入），context_lens=0（FlashAttention 输出 NaN/0，被后续 `[:bs]` 截掉）
+- graph 录制时 bs=4，实际 bs=3，多出的 1 个"虚假"token 的 slot=-1（Triton kernel 跳过写入），
+  其 cu_seqlens_k 段长 0（被后续 `compute_logits` 按 `query_start_loc[1:]-1` 取 token 时截掉）
 
 ### 5.5 Graph Pool（显存管理）
 
@@ -441,38 +424,29 @@ SRAM 大小：A100 = 192 KB per SM，约可存 tile_q=128 行，tile_k=64 列（
 
 **HBM 访问量**：HBM 读写次数 ≈ seq_len × head_dim × num_pass，而不是 seq_len²，大幅减少 HBM 带宽消耗（HBM ~2 TB/s vs SRAM ~20 TB/s）。
 
-### 6.3 nano-vllm 中的两个接口
+### 6.3 nano-vllm 中的统一 varlen 接口
 
-#### `flash_attn_varlen_func`（prefill）
+#### 统一 `flash_attn_varlen_func`（prefill + decode 同一接口，C 轮统一）
+
+C 轮对齐后**不再分 prefill / decode 两个 flash 接口**：统一用 `flash_attn_varlen_func` 一个调用覆盖
+（decode = query_len 1 的退化，prefix-cache = `cu_k > cu_q` 的特例）。`layers/attention/flash_attn.py`：
 
 ```python
 o = flash_attn_varlen_func(
-    q,   # [total_tokens, num_heads, head_dim]  所有 seq 拼接
-    k, v,
-    cu_seqlens_q=[0, len_A, len_A+len_B, ...],   # 各 seq 在拼接后的起止位置
-    cu_seqlens_k=[0, klen_A, klen_A+klen_B, ...], # KV 长度（含前缀缓存时 > q）
-    max_seqlen_q=..., max_seqlen_k=...,
-    causal=True,           # 下三角 mask（自回归）
-    block_table=...,       # 前缀缓存时有值（分页 KV 地址映射），无则 None
-)
-```
-
-`cu_seqlens_k > cu_seqlens_q`：前缀缓存已有历史 KV，本步 query 只有 `seqlen_q` 个但要 attend to `seqlen_k` 个 key。此时 FlashAttention 直接从 `k_cache/v_cache` 按 `block_table` 读取历史 KV。
-
-#### `flash_attn_with_kvcache`（decode）
-
-```python
-o = flash_attn_with_kvcache(
-    q.unsqueeze(1),   # [bs, 1, num_heads, head_dim]  每 seq 只有 1 个 query
-    k_cache,          # [num_blocks, block_size, num_kv_heads, head_dim]
-    v_cache,
-    cache_seqlens=context_lens,   # [bs]  每 seq 有多少有效 KV（不含 padding）
-    block_table=block_tables,     # [bs, max_blocks]  分页地址映射
+    q,   # [total_tokens, num_heads, head_dim]  所有 seq（prefill chunk + decode）拼接
+    k_cache, v_cache,                            # block_table 非 None 时从分页 cache 读
+    cu_seqlens_q=attn_md.query_start_loc,        # 各段 query 起止（decode 段长 1）
+    cu_seqlens_k=attn_md.cu_seqlens_k,           # KV 累计长度（历史 + 本步；前缀/decode 时 > q）
+    max_seqlen_q=attn_md.max_query_len, max_seqlen_k=attn_md.max_seq_len,
     causal=True,
+    block_table=attn_md.block_table,             # 无 KV 块时（仅 warmup）为 None，走裸 k/v
 )
 ```
 
-decode 时的 Q 只有 1 个 token，KV 来自整个历史（从 kv_cache 中按 block_table 读取）。FlashAttention 内部会自动处理分页读取逻辑。
+- `cu_seqlens_k > cu_seqlens_q`：已有历史 KV（前缀缓存命中 / decode / chunk 续算），本步 query 只有
+  `seqlen_q` 个但 attend 到 `seqlen_k` 个 key——FlashAttention 按 `block_table` 从分页 cache 读历史。
+- flash_attn 2.8.x 无 `seqused_k`，故统一用 `cu_seqlens_k` 表达每段 KV 总长。
+- CPU / 无 flash 时由 `get_attn_backend` 选 `TorchSDPA` 后端逐序列计算（同一 `AttentionMetadata`）。
 
 ### 6.4 KV 写入：为什么用 Triton 而非 PyTorch scatter？
 
@@ -493,79 +467,76 @@ Triton kernel（store_kvcache_kernel）：
 
 ---
 
-## 7. 全局推理上下文（Context）
+## 7. 显式注意力元数据（AttentionMetadata）
 
-### 7.1 设计动机
+### 7.1 设计动机与演进
 
-Attention 层需要 `cu_seqlens`、`slot_mapping`、`block_tables` 等推理元数据，但：
-- 这些是**运行时状态**，与模型结构无关
-- 每步推理才会确定，不是模型的固定参数
-- 如果作为 `forward` 参数传递：每层都要透传，签名臃肿，且 CUDA Graph 录制时参数必须固定
+Attention 层需要 `query_start_loc`(cu_seqlens_q)、`cu_seqlens_k`、`slot_mapping`、`block_table`
+等推理元数据，它们是**运行时状态**、与模型结构无关、每步才确定。
 
-**解决**：全局单例 `_CONTEXT`，在 `prepare_prefill/decode` 时写入，在需要的层中读取，forward 结束后 reset。
+早期 nano 用全局单例 `_CONTEXT`（prepare 时写、层内读、forward 后 reset）。**B 轮对齐 V1** 后改为
+**显式 `AttentionMetadata`**（`utils/context.py` 的 dataclass）：由 `InputBatch.make_inputs` 每步构造
+一次，经 `model.forward(input_ids, positions, attn_md)` → DecoderLayer → `Attention.forward(..., attn_md)`
+**显式透传**，不再有隐式全局态。这与 V1 `CommonAttentionMetadata` 经 forward 链传递一致，也便于多
+后端（`get_attn_backend` 选 flash/sdpa）各自消费。
 
-### 7.2 Context 字段完整说明
+### 7.2 AttentionMetadata 字段
 
-| 字段 | prefill | decode | 含义 |
-|------|---------|--------|------|
-| `is_prefill` | True | False | 当前步类型，决定 FlashAttention 接口选择 |
-| `cu_seqlens_q` | ✓（[B+1]） | — | query 累计长度，`cu_seqlens_q[i+1]-cu_seqlens_q[i]` 为第 i 个 seq 的 query 数 |
-| `cu_seqlens_k` | ✓（[B+1]） | — | KV 累计长度，前缀缓存时 `cu_k[i] > cu_q[i]` |
-| `max_seqlen_q` | ✓ | — | 批次最大 query 长度，FlashAttention 优化分块用 |
-| `max_seqlen_k` | ✓ | — | 批次最大 KV 长度 |
-| `slot_mapping` | ✓（[total_tokens]） | ✓（[bs]） | token → KV cache slot，-1 表示 dummy |
-| `context_lens` | — | ✓（[bs]） | 每 seq 的有效 KV 长度（历史 + 当前） |
-| `block_tables` | 有前缀时（[B, max_blocks]） | ✓（[bs, max_blocks]） | 分页地址映射，-1 填充 |
+| 字段 | 含义 |
+|------|------|
+| `query_start_loc`（[B+1]） | query 累计长度，`[i+1]-[i]` 为第 i 个 seq 本步的 query 数（decode 为 1） |
+| `cu_seqlens_k`（[B+1]） | KV 累计长度（已缓存 + 本步）；前缀缓存/decode 时 `cu_k[i+1]-cu_k[i] > query` |
+| `max_query_len` / `max_seq_len` | 批次最大 query / KV 长度；`is_decode_only` 由 `max_query_len==1` 派生 |
+| `slot_mapping`（[total_tokens]） | token → KV cache slot，-1 表示无效（warmup / graph dummy） |
+| `block_table`（[B, max_blocks]） | 分页地址映射；warmup 无 KV 时为 None（走裸 k/v） |
 
-### 7.3 Context 与 CUDA Graph 的交互
+> 统一连续批后无 `is_prefill` 字段——prefill chunk（query>1）与 decode（query=1）混排在同一批，
+> 由 `query_start_loc` 区分每段长度。`compute_logits` 用 `query_start_loc[1:]-1` 取每序列末 token。
 
-```
-capture_cudagraph 期间：
-  set_context(is_prefill=False, slot_mapping=slot_mapping_static, ...)
-  graph 录制 model.forward(input_ids_static, positions_static)
-  → Attention.forward() 内 get_context() 返回静态张量（被录制进 graph）
+### 7.3 与 CUDA Graph 的交互
 
-replay 期间：
-  # 直接修改静态张量的数据（不改变地址）
-  graph_vars["slot_mapping"].fill_(-1)
-  graph_vars["slot_mapping"][:bs] = new_slot_mapping
-  → graph.replay() 时 Attention 读到的是新数据，因为 CUDA Graph 硬编码了指针
-```
-
-这是 CUDA Graph 的精妙之处：graph 内存储的是 GPU 内存地址（指针），而不是值。修改静态张量的值等于修改 graph 读取的输入数据，无需重新录制。
+CUDA Graph 录制时存的是 GPU 内存**地址（指针）**而非值。decode graph 捕获时用常驻静态张量构造
+`AttentionMetadata`；replay 前把本步数据写入这些静态张量（`gv["slot_mapping"][:bs]=...`、
+`gv["cu_seqlens_k"][:bs+1]=...`、`gv["block_tables"][:bs]=...`），`graph.replay()` 即读到新数据，
+无需重录。`max_seq_len` 录制时取 `max_model_len`（高估对 varlen kernel 安全），故同一 graph 服务任意
+KV 长度的 decode。
 
 ---
 
-## 8. Token 采样（Gumbel-max Trick）
+## 8. Token 采样（结构化采样层）
 
-### 8.1 标准 Categorical 采样的问题
+**J 轮对齐 V1** 后，采样从单函数升级为结构化层 `layers/sample/`：`SamplingMetadata`（按行批配置）+
+`Sampler` + `ops/{topk_topp, penalties, logprobs}`，支持**真·greedy（temperature=0）、top-k、top-p、
+presence/frequency/repetition 惩罚、logprobs**，并按行混合 greedy/随机。
 
-`torch.multinomial(probs, 1)` 内部需要计算累积分布函数（CDF）并做二分查找，本质是串行的，对于大 vocab_size（151936）批量采样效率低。
-
-### 8.2 Gumbel-max 等价定理
-
-**定理**：若 $G_i \sim \text{Gumbel}(0,1)$（标准 Gumbel 分布），则：
-$$\arg\max_i (\log p_i + G_i) \sim \text{Categorical}(p)$$
-
-**代码使用的等价形式**（Exponential 采样）：
-
-标准 Gumbel 分布可由 $G = -\log(\text{Exponential}(1))$ 采样，因此：
-$$\arg\max_i (\log p_i - \log U_i) = \arg\max_i (p_i / U_i), \quad U_i \sim \text{Exp}(1)$$
+### 8.1 Sampler 主流程
 
 ```python
-# sampler.py
-logits = logits / temperature                      # 温度缩放
-probs = F.softmax(logits, dim=-1)                 # [bs, vocab_size]
-noise = torch.empty_like(probs).exponential_(1)   # U ~ Exp(1)，in-place 高效
-noise.clamp_min_(1e-10)                            # 防 log(0)
-token_ids = (probs / noise).argmax(dim=-1)         # [bs]
+# layers/sample/sampler.py（要点）
+if max_num_logprobs is not None: raw_logprobs = compute_logprobs(logits)  # 取惩罚/温度前
+logits = logits.float()
+if not no_penalties: logits = apply_all_penalties(...)                    # rep(prompt∪output)+freq+pres
+sampled = self.sample(logits, sm)            # 逐行 where(temp<eps, argmax, 温度+topk/topp 随机)
+if max_num_logprobs is not None: lp = gather_logprobs(raw_logprobs, k, sampled)
 ```
 
-**为什么等价于 categorical(p)？**
+`SamplingMetadata` 的批级标志 `all_greedy / all_random / no_penalties / top_p is None / top_k is None`
+让常见路径（纯 greedy / 纯温度采样）整段跳过惩罚与 top-k/p，零额外开销。
 
-直觉：概率高的词，分子 $p_i$ 大；加入 $1/U_i$（随机放大），高概率词获得更大值的概率恰好等于其原始概率。
+### 8.2 随机采样核心：Gumbel-max Trick
 
-**完全向量化**：整个 `probs / noise` 是一次 elementwise 除法（充分利用 GPU 并行），`argmax` 也是高效 reduction。`@torch.compile` 将 softmax + exponential + div + argmax 融合为单个 kernel，消除中间张量。
+非贪心行的随机采样用 Gumbel-max（`ops/topk_topp.py::random_sample`），向量化、无 CPU-GPU 同步：
+
+**定理**：若 $G_i \sim \text{Gumbel}(0,1)$，则 $\arg\max_i (\log p_i + G_i) \sim \text{Categorical}(p)$。
+等价形式（Exponential 采样）：$\arg\max_i (p_i / U_i),\ U_i \sim \text{Exp}(1)$。
+
+```python
+def random_sample(probs):
+    q = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)  # U ~ Exp(1)
+    return probs.div_(q).argmax(dim=-1).view(-1)
+```
+
+整个 `probs / q` 是一次 elementwise 除法 + 高效 argmax reduction，充分利用 GPU 并行。
 
 ### 8.3 Temperature Scaling 的数学意义
 

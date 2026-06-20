@@ -282,4 +282,4 @@ for block_hash in itertools.islice(block_hashes, max_num_blocks):
 
 - nano-vllm 源码：`nanovllm/engine/block_manager.py`、`scheduler.py`、`sequence.py`、`model_runner.py`、`nanovllm/layers/attention.py`、`config.py`（commit `f8d495d`，phase4 分支）
 - vLLM v1 源码（本地 checkout `/home/cb/work/vllm/vllm`）：`vllm/v1/core/block_pool.py`、`kv_cache_utils.py`、`kv_cache_manager.py`、`single_type_kv_cache_manager.py`
-- 相关设计文档：`docs/detailed_design.md`、`docs/chunked_prefill-调研报告-20260614.md`
+- 相关设计文档：`docs/02_core_concepts.md`、`docs/chunked_prefill-调研报告-20260614.md`

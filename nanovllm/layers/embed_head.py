@@ -8,7 +8,7 @@ try:
 except ImportError:
     _DIST_AVAILABLE = False
 
-from nanovllm.utils.context import get_context
+from nanovllm.utils.context import AttentionMetadata
 from nanovllm.layers.linear import _get_tp_info, divide
 
 
@@ -54,7 +54,9 @@ class ParallelLMHead(VocabParallelEmbedding):
     """
     并行 LM Head：与 VocabParallelEmbedding 共享权重结构（转置矩阵乘）。
 
-    prefill 优化：只对每个 seq 的最后一个 token 计算 logits。
+    统一连续批：每个 seq 只取其 query 段最后一个 token 计算 logits。
+    选取规则 cu_seqlens_q[1:]-1 对 prefill / decode / 混合批一致——decode 段
+    长度为 1 时退化为恒等选取。
     TP logits 汇聚：rank 0 用 dist.gather 收集所有 rank 的 partial logits。
     """
 
@@ -62,10 +64,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        context = get_context()
-        if context.is_prefill and context.cu_seqlens_q is not None:
-            last_indices = context.cu_seqlens_q[1:] - 1
+    def forward(self, x: torch.Tensor, attn_md: AttentionMetadata | None = None) -> torch.Tensor:
+        if attn_md is not None and attn_md.query_start_loc is not None:
+            last_indices = attn_md.query_start_loc[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1 and _DIST_AVAILABLE and dist.is_initialized():

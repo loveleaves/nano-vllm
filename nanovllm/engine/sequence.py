@@ -34,10 +34,12 @@ class Sequence:
     block_size: int = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params: SamplingParams = None):
+    def __init__(self, token_ids: list[int], sampling_params: SamplingParams = None,
+                 priority: int = 0):
         if sampling_params is None:
             sampling_params = SamplingParams()
         self.seq_id = next(Sequence.counter)
+        self.priority = priority   # 调度优先级（值越小越先；PriorityRequestQueue 用）
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
@@ -45,11 +47,20 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
-        self.is_prefill = True
         self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # 采样配置（仅 rank0 采样用，不入 __getstate__）
+        self.top_p = sampling_params.top_p
+        self.top_k = sampling_params.top_k
+        self.presence_penalty = sampling_params.presence_penalty
+        self.frequency_penalty = sampling_params.frequency_penalty
+        self.repetition_penalty = sampling_params.repetition_penalty
+        self.min_p = sampling_params.min_p
+        self.logprobs = sampling_params.logprobs
+        self.seed = sampling_params.seed
+        self.bad_words_token_ids = sampling_params.bad_words_token_ids
 
     def __len__(self) -> int:
         return self.num_tokens
@@ -61,6 +72,15 @@ class Sequence:
     @property
     def is_finished(self) -> bool:
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def is_prefill(self) -> bool:
+        """prompt 尚未全部写入 KV cache → 仍处于 prefill 阶段（含 chunked prefill 中途）。
+
+        统一连续批后不再有显式 prefill/decode 标志，该属性由调度进度派生，
+        仅用于 __getstate__ 的 pickle 优化（decode 只传 last_token）。
+        """
+        return self.num_cached_tokens < self.num_prompt_tokens
 
     @property
     def num_completion_tokens(self) -> int:
@@ -99,14 +119,29 @@ class Sequence:
         """
         自定义 pickle 序列化（进程间通信优化）：
           prefill 时序列化完整 token_ids；decode 时只序列化 last_token。
+
+        采样标量随状态一并传输：进程隔离（distributed_executor_backend="mp"）下，
+        采样发生在 rank0 **子进程**里、吃的是反序列化后的 Sequence，故 prepare_sample
+        需要这些字段。注意惩罚类采样还需完整 token 历史，但 decode 仅传 last_token，
+        故惩罚在隔离模式下不可用（见 docs/arch_worker_isolation/design.md 边界）。
         """
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-                self.num_scheduled_tokens, self.block_table, last_state)
+        return (self.seq_id, self.num_tokens, self.num_prompt_tokens,
+                self.num_cached_tokens, self.num_scheduled_tokens,
+                self.block_table, last_state,
+                self.temperature, self.top_p, self.top_k,
+                self.presence_penalty, self.frequency_penalty,
+                self.repetition_penalty, self.min_p, self.logprobs,
+                self.seed, self.bad_words_token_ids)
 
     def __setstate__(self, state):
-        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens,
-         self.num_scheduled_tokens, self.block_table, last_state) = state
+        (self.seq_id, self.num_tokens, self.num_prompt_tokens,
+         self.num_cached_tokens, self.num_scheduled_tokens,
+         self.block_table, last_state,
+         self.temperature, self.top_p, self.top_k,
+         self.presence_penalty, self.frequency_penalty,
+         self.repetition_penalty, self.min_p, self.logprobs,
+         self.seed, self.bad_words_token_ids) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

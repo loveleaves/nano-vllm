@@ -47,6 +47,7 @@ jobs:
             xxhash \
             numpy \
             tqdm \
+            msgspec \
             pytest \
             pytest-timeout
 

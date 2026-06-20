@@ -1,82 +1,62 @@
-import atexit
 from dataclasses import fields
 from time import perf_counter
+
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.core import EngineCore
+from nanovllm.engine.core_types import RequestOutput
+from nanovllm.engine.processor import Processor
+from nanovllm.engine.output_processor import OutputProcessor
 
 
 class LLMEngine:
     """
-    推理引擎主入口（Phase 4：多进程 TP）。
+    同步推理引擎入口（V1 风格组件装配，见 docs/arch_engine/design.md）。
 
-    多进程架构：
-      rank 0（主进程）：调度 + 推理 + 采样
-      rank 1..N（子进程）：ModelRunner.loop()，通过 SharedMemory+Event 等待指令
+    分层（对齐 vLLM V1 LLMEngine）：
+      Processor        — 输入处理：tokenize → EngineCoreRequest
+      EngineCore       — 调度 + 执行循环（持有 Scheduler + Worker，含多进程 TP）
+      OutputProcessor  — 增量 detokenize / 停止串 / finish reason → RequestOutput
+
+    本类只做装配与编排，不含调度、kernel 或文本处理细节。流式/异步入口见 AsyncLLM。
     """
 
     def __init__(self, model: str, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        Sequence.block_size = config.kvcache_block_size
-
-        self.ps = []
-        self.events = []
-        ctx = mp.get_context("spawn")
-
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-
-        self.model_runner = ModelRunner(config, 0, self.events)
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
 
-        self.scheduler = Scheduler(
-            num_kvcache_blocks=config.num_kvcache_blocks,
-            block_size=config.kvcache_block_size,
-            max_num_seqs=config.max_num_seqs,
-            max_num_batched_tokens=config.max_num_batched_tokens,
-            eos=config.eos,
-        )
-        atexit.register(self.exit)
+        self.processor = Processor(self.tokenizer)
+        self.engine_core = EngineCore(config)
+        self.output_processor = OutputProcessor(self.tokenizer)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
-        for p in self.ps:
-            p.join()
+        self.engine_core.exit()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
+    def add_request(self, prompt: str | list[int],
+                    sampling_params: SamplingParams, priority: int = 0) -> str:
+        """登记一条请求，返回其 request_id。"""
+        req = self.processor.process_inputs(prompt, sampling_params, priority=priority)
+        self.engine_core.add_request(req)
+        self.output_processor.add_request(req)
+        return req.request_id
 
-    def step(self) -> tuple[list[tuple], int]:
-        seqs, is_prefill = self.scheduler.schedule()
-        if not seqs:
-            return [], 0
-        num_tokens = (sum(seq.num_scheduled_tokens for seq in seqs)
-                      if is_prefill else -len(seqs))
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+    def step(self) -> tuple[list[RequestOutput], int]:
+        """推进一步：EngineCore.step → OutputProcessor → 处理输出侧 abort。"""
+        core_outputs = self.engine_core.step()
+        processed = self.output_processor.process_outputs(core_outputs.outputs)
+        if processed.reqs_to_abort:
+            self.engine_core.abort_requests(processed.reqs_to_abort)
+        return processed.request_outputs, core_outputs.num_tokens
 
     def is_finished(self) -> bool:
-        return self.scheduler.is_finished()
+        return not self.engine_core.has_unfinished_requests()
 
     def generate(
         self,
@@ -84,19 +64,20 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[dict]:
-        pbar = tqdm(total=len(prompts), desc="Generating",
-                    dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
 
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+        request_ids = [self.add_request(p, sp)
+                       for p, sp in zip(prompts, sampling_params)]
 
-        outputs = {}
+        pbar = tqdm(total=len(prompts), desc="Generating",
+                    dynamic_ncols=True, disable=not use_tqdm)
+        results: dict[str, RequestOutput] = {}
         prefill_throughput = decode_throughput = 0.0
+
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            request_outputs, num_tokens = self.step()
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
             elif num_tokens < 0:
@@ -105,13 +86,11 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                pbar.update(1)
+            for ro in request_outputs:
+                if ro.finished:
+                    results[ro.request_id] = ro
+                    pbar.update(1)
 
         pbar.close()
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        return [
-            {"text": self.tokenizer.decode(tids), "token_ids": tids}
-            for tids in outputs
-        ]
+        ordered = [results[rid] for rid in request_ids]
+        return [{"text": ro.text, "token_ids": ro.token_ids} for ro in ordered]

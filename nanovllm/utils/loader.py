@@ -35,7 +35,12 @@ def load_model(model: nn.Module, path: str):
                     if k in weight_name:
                         v, shard_id = packed_modules_mapping[k]
                         param_name = weight_name.replace(k, v)
-                        param = model.get_parameter(param_name)
+                        # 目标参数不存在则跳过（如模型未实现的子结构：Qwen3.5 的 MTP 头、
+                        # VLM 视觉塔等带 gate_proj/up_proj 的权重）
+                        try:
+                            param = model.get_parameter(param_name)
+                        except AttributeError:
+                            break
                         loader = getattr(param, "weight_loader", default_weight_loader)
                         loader(param, f.get_tensor(weight_name), shard_id)
                         break

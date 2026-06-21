@@ -101,6 +101,8 @@ class _ModelRegistry:
 # ─── 内置模型表（架构名 → "模块:类名"，惰性导入） ──────────────────────────────
 _BUILTIN_MODELS: dict[str, str] = {
     "Qwen3ForCausalLM": "nanovllm.models.qwen3:Qwen3ForCausalLM",
+    # Qwen3.5（VLM 包装）：nano 仅取文本主干（dense 混合线性注意力）
+    "Qwen3_5ForConditionalGeneration": "nanovllm.models.qwen35:Qwen35ForCausalLM",
 }
 
 ModelRegistry = _ModelRegistry()

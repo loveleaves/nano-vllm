@@ -23,6 +23,9 @@ class AttentionMetadata:
       slot_mapping    — [total_tokens]，每个本步 token 写入 KV cache 的绝对 slot 编号。
       block_table     — [num_seqs, max_blocks]，分页 KV 地址。
                         None 表示无 KV cache（仅 warmup 阶段），attention 退回裸 k/v。
+      state_slots     — [num_seqs] 的 list[int]，线性注意力（GatedDeltaNet）每个序列的
+                        recurrent/conv 状态槽位（按批行序对齐 query_start_loc 的分段）。
+                        仅混合模型（Qwen3.5）使用；纯全注意力模型恒为 None。
     """
     query_start_loc: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
@@ -30,6 +33,7 @@ class AttentionMetadata:
     max_seq_len: int = 0
     slot_mapping: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
+    state_slots: list | None = None
 
     @property
     def is_decode_only(self) -> bool:

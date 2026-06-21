@@ -44,6 +44,9 @@ class ModelRunner:
         """
         self.config = config
         hf_config = config.hf_config
+        # 文本主干配置：VLM 包装（如 Qwen3.5）把解码器超参放在 text_config 下；普通文本模型
+        # text_config 不存在则退回 hf_config 自身。引擎层（KV cache / 采样 / graph）一律读它。
+        self.text_config = getattr(hf_config, "text_config", hf_config)
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
@@ -64,7 +67,7 @@ class ModelRunner:
 
         default_dtype = torch.get_default_dtype()
         # CPU 上 fp16 的 SDPA / 多数算子支持不全，统一用 fp32（权重 copy_ 时自动转换）
-        run_dtype = hf_config.dtype if self.is_cuda else torch.float32
+        run_dtype = self.text_config.dtype if self.is_cuda else torch.float32
         torch.set_default_dtype(run_dtype)
         torch.set_default_device(self.device)
 
@@ -90,7 +93,12 @@ class ModelRunner:
             block_size=self.block_size, device=self.device, pin_memory=self.pin_memory,
         )
 
+        # 线性注意力（GatedDeltaNet）递归状态池：须在 warmup 前分配（warmup 前向会经过它）。
+        # 含线性注意力的混合模型强制 eager（递归状态的数据依赖索引无法稳定进 CUDA graph）。
+        self._init_linear_attn_state()
+
         self.warmup_model()
+        self._reset_linear_attn_state()   # 清掉 warmup 占用的状态槽 / 残留状态
         self.allocate_kv_cache()
 
         if self.is_cuda and not self.enforce_eager:
@@ -98,6 +106,58 @@ class ModelRunner:
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+
+    # ── 线性注意力（GatedDeltaNet）递归状态池 ─────────────────────────────────────
+    def _init_linear_attn_state(self):
+        """探测线性注意力模块、分配每序列状态池、初始化槽位分配器。
+
+        鸭子类型探测 `needs_state_pool`，避免引擎硬依赖具体模型类。槽位数 = max_num_seqs
+        （每个并发序列占一个递归状态槽）。含线性注意力 → 强制 eager。
+        """
+        self._lin_modules = [m for m in self.model.modules()
+                             if getattr(m, "needs_state_pool", False)]
+        self.has_linear_attn = bool(self._lin_modules)
+        self._lin_slots: dict[int, int] = {}          # seq_id → 状态槽
+        self._free_slots: list[int] = []
+        if not self.has_linear_attn:
+            return
+        self.enforce_eager = True
+        self._num_state_slots = self.config.max_num_seqs
+        for m in self._lin_modules:
+            m.allocate_state(self._num_state_slots)
+        self._free_slots = list(range(self._num_state_slots))
+
+    def _reset_linear_attn_state(self):
+        """重置槽位分配器并清零所有递归状态（warmup 后调用）。"""
+        if not self.has_linear_attn:
+            return
+        self._lin_slots.clear()
+        self._free_slots = list(range(self._num_state_slots))
+        for m in self._lin_modules:
+            m.conv_state.zero_()
+            m.recurrent_state.zero_()
+
+    def _assign_state_slots(self, ordered, finished_seq_ids):
+        """回收已结束/被抢占序列的槽 → 为本批各序列取/分配槽（新序列状态清零）。
+
+        返回按批行序对齐的 list[int]，写入 attn_md.state_slots 供 GatedDeltaNet 索引。
+        """
+        if finished_seq_ids:
+            for sid in finished_seq_ids:
+                slot = self._lin_slots.pop(sid, None)
+                if slot is not None:
+                    self._free_slots.append(slot)
+        slots = []
+        for seq in ordered:
+            slot = self._lin_slots.get(seq.seq_id)
+            if slot is None:
+                slot = self._free_slots.pop()
+                self._lin_slots[seq.seq_id] = slot
+                for m in self._lin_modules:          # 槽可能复用，新序列须从零状态开始
+                    m.conv_state[slot].zero_()
+                    m.recurrent_state[slot].zero_()
+            slots.append(slot)
+        return slots
 
     def exit(self):
         """释放 GPU 资源（graph / KV cache / 模型 / 进程组）。RPC 传输的关闭由 Worker 负责。
@@ -152,11 +212,12 @@ class ModelRunner:
     def allocate_kv_cache(self):
         """根据可用内存计算并分配 KV cache 张量（块字节/块数计算由 KVCacheSpec 承担）。"""
         config = self.config
-        hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim",
-                           hf_config.hidden_size // hf_config.num_attention_heads)
-        num_layers = hf_config.num_hidden_layers
+        tc = self.text_config
+        num_kv_heads = tc.num_key_value_heads // self.world_size
+        head_dim = getattr(tc, "head_dim", None) or tc.hidden_size // tc.num_attention_heads
+        # 仅统计真正持有 KV cache 的全注意力层（混合模型的线性注意力层不进 KV）。
+        # 对纯全注意力模型（Qwen3）等于 num_hidden_layers。
+        num_layers = sum(1 for module in self.model.modules() if isinstance(module, Attention))
 
         # KVCacheSpec 封装单层单块字节数与"可用内存 → 块数"反推（对齐 V1）。dtype 取运行 dtype
         # （CPU 后端为 fp32），保证块字节估算与实际 kv_cache 张量一致。
@@ -227,7 +288,7 @@ class ModelRunner:
         整批无某项配置时该字段置 None / no_penalties，Sampler 据此整段跳过，
         使 greedy / 纯温度采样的常见路径零额外开销。
         """
-        vocab_size = self.config.hf_config.vocab_size
+        vocab_size = self.text_config.vocab_size
         eps = 1e-5
 
         temps = [seq.temperature for seq in seqs]
@@ -386,6 +447,8 @@ class ModelRunner:
                 self.generators.pop(sid, None)
         self.input_batch.update(seqs, finished_seq_ids)
         input_ids, positions, attn_md, ordered = self.input_batch.make_inputs(seqs)
+        if self.has_linear_attn:
+            attn_md.state_slots = self._assign_state_slots(ordered, finished_seq_ids)
         logits = self.run_model(input_ids, positions, attn_md)
         if self.rank != 0:
             return None
@@ -417,6 +480,8 @@ class ModelRunner:
                 self.generators.pop(sid, None)
         self.input_batch.update(seqs, finished_seq_ids)
         input_ids, positions, attn_md, ordered = self.input_batch.make_inputs(seqs)
+        if self.has_linear_attn:
+            attn_md.state_slots = self._assign_state_slots(ordered, finished_seq_ids)
 
         # 前向：把上一步采样 token（GPU 张量）就地写入本步 decode 行的输入位（无 D2H）
         if self._ai is not None:
@@ -476,7 +541,7 @@ class ModelRunner:
         静态张量在录制期间预分配，replay 时修改数据即可。
         """
         config = self.config
-        hf_config = config.hf_config
+        hf_config = self.text_config
         max_bs = min(config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
 

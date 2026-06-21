@@ -86,10 +86,38 @@ class Config:
             assert not self.async_scheduling, "投机解码与 async_scheduling 互斥"
             assert self.speculative_ngram_max >= 1
 
+        self.hf_config = self._load_hf_config()
+        if self.hf_config is not None:
+            # VLM 包装（如 Qwen3.5）把解码器超参放在 text_config 下
+            tc = getattr(self.hf_config, "text_config", self.hf_config)
+            mpe = getattr(tc, "max_position_embeddings", None)
+            if mpe:
+                self.max_model_len = min(self.max_model_len, mpe)
+
+    def _load_hf_config(self):
+        """加载 HF config。优先 AutoConfig；transformers 版本不认识 model_type（如
+        qwen3_5）时回退为直接解析 config.json → SimpleNamespace（保留顶层 architectures
+        与嵌套 text_config，dtype 字符串转 torch.dtype）。失败返回 None（纯 Python 测试场景）。
+        """
         # 延迟导入 transformers，避免在纯 Python 测试中不必要的依赖
         try:
             from transformers import AutoConfig
-            self.hf_config = AutoConfig.from_pretrained(self.model)
-            self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+            return AutoConfig.from_pretrained(self.model)
         except Exception:
             pass
+        try:
+            import json
+            from types import SimpleNamespace
+            import torch
+            with open(os.path.join(self.model, "config.json")) as f:
+                cfg = json.load(f)
+            # text_config 转为一层 SimpleNamespace（保留 rope_parameters 等内层 dict / layer_types 列表）
+            tc = cfg.get("text_config")
+            if isinstance(tc, dict):
+                raw = tc.get("torch_dtype") or tc.get("dtype")
+                if isinstance(raw, str):
+                    tc["dtype"] = getattr(torch, raw, torch.bfloat16)
+                cfg["text_config"] = SimpleNamespace(**tc)
+            return SimpleNamespace(**cfg)
+        except Exception:
+            return None

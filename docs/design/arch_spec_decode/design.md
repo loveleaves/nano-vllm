@@ -46,6 +46,22 @@ verify_greedy(draft, target):   # len(target) == len(draft)+1
 
 `NgramProposer.propose`：取尾部长度 n∈[max_n..min_n] 的 n-gram，自后向前找更早的相同
 n-gram，返回其后最多 k 个 token；优先用更长的 n-gram（匹配更可信）。
+### 直观流程图
+
+```mermaid
+flowchart TD
+    A[输入当前已生成 token 序列] --> B[取当前尾部的 n-gram]
+    B --> C[从后往前扫描历史位置]
+    C --> D{是否找到相同 n-gram?}
+    D -- 是 --> E[取该位置后面的 k 个 token]
+    E --> F[返回作为草案 proposal]
+    D -- 否 --> G[尝试更短的 n-gram]
+    G --> H{还有更短长度可试?}
+    H -- 是 --> B
+    H -- 否 --> I[返回空草案]
+    F --> J[目标模型验证]
+    J --> K[接受/拒绝并追加 token]
+```
 
 ### GPU verify 循环集成（已实现，UniProc-only，门控 `Config.speculative_num_tokens>0`）
 
